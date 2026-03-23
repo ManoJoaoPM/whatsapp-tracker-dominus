@@ -103,10 +103,10 @@ function DashboardLayout({ children }: { children: React.ReactNode }) {
           <div className="flex items-center justify-between px-2 py-2">
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-md bg-zinc-100 flex items-center justify-center text-zinc-600 font-medium border border-zinc-200 uppercase">
-                {user.name.charAt(0)}
+                {user.name?.charAt(0) || 'U'}
               </div>
               <div className="flex flex-col">
-                <span className="text-sm font-medium text-zinc-800 leading-none">{user.name}</span>
+                <span className="text-sm font-medium text-zinc-800 leading-none">{user.name || 'Usuário'}</span>
                 <span className="text-[10px] text-zinc-500 mt-1 truncate max-w-[120px]">{user.email}</span>
               </div>
             </div>

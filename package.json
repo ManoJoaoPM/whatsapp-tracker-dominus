@@ -11,7 +11,7 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "check": "tsc --noEmit",
-    "server:dev": "nodemon",
+    "server:dev": "nodemon --watch api --ext ts --exec \"tsx api/server.ts\"",
     "dev": "concurrently \"npm run client:dev\" \"npm run server:dev\""
   },
   "dependencies": {
