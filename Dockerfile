@@ -27,10 +27,8 @@ RUN npm ci --omit=dev
 # Copy built frontend
 COPY --from=builder /app/dist ./dist
 
-# Copy built backend
+# Copy built backend 
 COPY --from=builder /app/api/dist ./api/dist
-# Copy backend package.json if it exists (for module resolution)
-COPY --from=builder /app/api/package*.json ./api/
 
 # Set environment variable to indicate production
 ENV NODE_ENV=production
