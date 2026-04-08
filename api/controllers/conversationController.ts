@@ -3,7 +3,35 @@ import { ClientRequest } from '../middlewares/clientMiddleware.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import { sendMessage as evolutionSendMessage, fetchChatHistory } from '../services/evolutionService.js';
-import Client from '../models/Client.js';
+import { tryAutoScoreMql } from '../services/mqlAutoScore.js';
+
+const FUNNEL_STAGES = [
+  'first_contact',
+  'replied',
+  'qualified',
+  'proposal',
+  'scheduled',
+  'closed',
+  'lost',
+] as const;
+
+type FunnelStage = (typeof FUNNEL_STAGES)[number];
+
+const toCard = (conv: any) => ({
+  id: String(conv._id),
+  clientId: String(conv.clientId),
+  contactName: conv.contactName || undefined,
+  contactPhone: conv.contactPhone,
+  origin: conv.origin,
+  funnelStage: conv.funnelStage,
+  lastMessageAt: new Date(conv.lastMessageAt).toISOString(),
+  lastMessagePreview: conv.lastMessageContent || undefined,
+  unreadCount: conv.unreadCount || 0,
+});
+
+const isFunnelStage = (value: any): value is FunnelStage => {
+  return FUNNEL_STAGES.includes(value);
+};
 
 export const getConversations = async (req: ClientRequest, res: Response): Promise<void> => {
   try {
@@ -19,6 +47,96 @@ export const getConversations = async (req: ClientRequest, res: Response): Promi
 
     const conversations = await Conversation.find(filter).sort({ lastMessageAt: -1 }).limit(20);
     res.json(conversations);
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+export const getConversationById = async (req: ClientRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const conversation = await Conversation.findOne({ _id: id, clientId: req.currentClient.id }).lean();
+    if (!conversation) {
+      res.status(404).json({ message: 'Conversation not found' });
+      return;
+    }
+    res.json(conversation);
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+export const getKanban = async (req: ClientRequest, res: Response): Promise<void> => {
+  try {
+    const baseFilter: any = { clientId: req.currentClient.id };
+
+    const origin = typeof req.query.origin === 'string' ? req.query.origin : '';
+    const stage = typeof req.query.stage === 'string' ? req.query.stage : '';
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const from = typeof req.query.from === 'string' ? req.query.from : '';
+    const to = typeof req.query.to === 'string' ? req.query.to : '';
+
+    const perStageRaw = typeof req.query.perStage === 'string' ? Number(req.query.perStage) : 50;
+    const perStage = Number.isFinite(perStageRaw) ? Math.max(1, Math.min(200, perStageRaw)) : 50;
+
+    if (origin) baseFilter.origin = origin;
+    if (stage) baseFilter.funnelStage = stage;
+
+    if (from || to) {
+      baseFilter.lastMessageAt = {};
+      if (from) {
+        const d = new Date(from);
+        if (!Number.isNaN(d.getTime())) baseFilter.lastMessageAt.$gte = d;
+      }
+      if (to) {
+        const d = new Date(to);
+        if (!Number.isNaN(d.getTime())) baseFilter.lastMessageAt.$lte = d;
+      }
+      if (Object.keys(baseFilter.lastMessageAt).length === 0) {
+        delete baseFilter.lastMessageAt;
+      }
+    }
+
+    if (q) {
+      const rx = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      baseFilter.$or = [
+        { contactName: rx },
+        { contactPhone: rx },
+        { lastMessageContent: rx },
+      ];
+    }
+
+    const countsAgg = await Conversation.aggregate([
+      { $match: baseFilter },
+      { $group: { _id: '$funnelStage', count: { $sum: 1 } } },
+    ]);
+
+    const counts: Record<string, number> = Object.fromEntries(FUNNEL_STAGES.map((s) => [s, 0]));
+    for (const row of countsAgg) {
+      if (row?._id && typeof row.count === 'number') {
+        counts[String(row._id)] = row.count;
+      }
+    }
+
+    const columnsEntries = await Promise.all(
+      FUNNEL_STAGES.map(async (s) => {
+        const stageFilter = { ...baseFilter, funnelStage: s };
+        const convs = await Conversation.find(stageFilter)
+          .sort({ lastMessageAt: -1 })
+          .limit(perStage)
+          .select('_id clientId contactPhone contactName origin funnelStage lastMessageAt lastMessageContent unreadCount')
+          .lean();
+        return [s, convs.map(toCard)] as const;
+      })
+    );
+
+    const columns = Object.fromEntries(columnsEntries);
+
+    res.json({
+      stages: FUNNEL_STAGES,
+      columns,
+      counts,
+    });
   } catch (error: any) {
     res.status(500).json({ message: error.message });
   }
@@ -137,6 +255,18 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
       }
     }
 
+    if (!conversation.messageCount) {
+      const count = await Message.countDocuments({ conversationId: id });
+      conversation.messageCount = count;
+      if (!conversation.mqlLastScoredMessageCount) conversation.mqlLastScoredMessageCount = 0;
+      await conversation.save();
+    }
+
+    const io = req.app.get('io');
+    setTimeout(() => {
+      void tryAutoScoreMql({ conversationId: conversation.id, clientId: req.currentClient.id, io });
+    }, 0);
+
     const messages = await Message.find({ conversationId: id }).sort({ timestamp: 1 });
     res.json(messages);
   } catch (error: any) {
@@ -182,7 +312,13 @@ export const sendMessage = async (req: ClientRequest, res: Response): Promise<vo
     // Update conversation
     conversation.lastMessageAt = new Date();
     conversation.lastOutboundMessageAt = new Date();
+    conversation.messageCount = Number(conversation.messageCount || 0) + 1;
     await conversation.save();
+
+    const io = req.app.get('io');
+    setTimeout(() => {
+      void tryAutoScoreMql({ conversationId: conversation.id, clientId: req.currentClient.id, io });
+    }, 0);
 
     res.json(newMessage);
   } catch (error: any) {
@@ -195,6 +331,11 @@ export const updateFunnelStage = async (req: ClientRequest, res: Response): Prom
     const { id } = req.params;
     const { stage } = req.body;
 
+    if (!isFunnelStage(stage)) {
+      res.status(400).json({ message: 'Invalid funnel stage' });
+      return;
+    }
+
     const conversation = await Conversation.findOne({ _id: id, clientId: req.currentClient.id });
     if (!conversation) {
       res.status(404).json({ message: 'Conversation not found' });
@@ -205,10 +346,15 @@ export const updateFunnelStage = async (req: ClientRequest, res: Response): Prom
     conversation.funnelHistory.push({
       stage,
       changedAt: new Date(),
-      changedBy: req.user.name
+      changedBy: req.user?.name || req.user?.email || 'user'
     });
 
     await conversation.save();
+
+    const io = req.app.get('io');
+    if (io) {
+      io.to(String(req.currentClient.id)).emit('conversation_updated', { conversation: toCard(conversation) });
+    }
     res.json(conversation);
   } catch (error: any) {
     res.status(500).json({ message: error.message });

@@ -18,6 +18,16 @@ export interface IConversation extends Document {
   lastMessageContent?: string;
   unreadCount: number;
   historySynced?: boolean;
+  mqlScore?: number;
+  mqlLevel?: 'cold' | 'warm' | 'hot';
+  mqlSummary?: string;
+  mqlSignals?: string[];
+  mqlUpdatedAt?: Date;
+  mqlModel?: string;
+  mqlRulesHash?: string;
+  messageCount?: number;
+  mqlLastScoredMessageCount?: number;
+  mqlScoring?: boolean;
   createdAt: Date;
 }
 
@@ -43,6 +53,16 @@ const ConversationSchema = new Schema<IConversation>({
   lastMessageContent: { type: String },
   unreadCount: { type: Number, default: 0 },
   historySynced: { type: Boolean, default: false },
+  mqlScore: { type: Number },
+  mqlLevel: { type: String, enum: ['cold', 'warm', 'hot'] },
+  mqlSummary: { type: String },
+  mqlSignals: [{ type: String }],
+  mqlUpdatedAt: { type: Date },
+  mqlModel: { type: String },
+  mqlRulesHash: { type: String },
+  messageCount: { type: Number, default: 0 },
+  mqlLastScoredMessageCount: { type: Number, default: 0 },
+  mqlScoring: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
 

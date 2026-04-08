@@ -7,8 +7,9 @@ import Dashboard from "@/pages/Dashboard";
 import Conversations from "@/pages/Conversations";
 import Connection from "@/pages/Connection";
 import Admin from "@/pages/Admin";
+import Kanban from "@/pages/Kanban";
 import { useAuthStore } from "@/store/useAuthStore";
-import { LayoutDashboard, Users, UserPlus, Database, MessageSquare, Briefcase, Settings, LogOut, MoreVertical } from "lucide-react";
+import { LayoutDashboard, MessageSquare, Briefcase, Settings, LogOut, KanbanSquare } from "lucide-react";
 
 export default function App() {
   return (
@@ -19,6 +20,7 @@ export default function App() {
         <Route path="/register" element={<Register />} />
         <Route path="/dashboard" element={<DashboardLayout><Dashboard /></DashboardLayout>} />
         <Route path="/conversations" element={<DashboardLayout><Conversations /></DashboardLayout>} />
+        <Route path="/app/kanban" element={<DashboardLayout><Kanban /></DashboardLayout>} />
         <Route path="/connection" element={<DashboardLayout><Connection /></DashboardLayout>} />
         <Route path="/admin" element={<DashboardLayout><Admin /></DashboardLayout>} />
       </Routes>
@@ -87,6 +89,10 @@ function DashboardLayout({ children }: { children: React.ReactNode }) {
             <a href="/conversations" className={navItemClass('/conversations')}>
               <MessageSquare size={18} />
               Leads
+            </a>
+            <a href="/app/kanban" className={navItemClass('/app/kanban')}>
+              <KanbanSquare size={18} />
+              Kanban
             </a>
             <a href="/connection" className={navItemClass('/connection')}>
               <Settings size={18} />

@@ -10,6 +10,7 @@ export interface IClient extends Document {
     phoneNumber?: string;
     connectedAt?: Date;
   };
+  mqlRules?: string;
 }
 
 const ClientSchema = new Schema<IClient>({
@@ -21,7 +22,8 @@ const ClientSchema = new Schema<IClient>({
     status: { type: String, enum: ['connected', 'disconnected', 'pending'], default: 'pending' },
     phoneNumber: { type: String },
     connectedAt: { type: Date }
-  }
+  },
+  mqlRules: { type: String }
 });
 
 export default mongoose.model<IClient>('Client', ClientSchema);

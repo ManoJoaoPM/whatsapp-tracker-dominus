@@ -4,6 +4,8 @@ import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import OriginEvent from '../models/OriginEvent.js';
 import { fetchMediaBase64, fetchSavedContactName } from '../services/evolutionService.js';
+import { tryAutoScoreMql } from '../services/mqlAutoScore.js';
+import { extractMetaCtwaClidFromEvolutionMessage } from '../services/originDetection.js';
 
 export const handleEvolutionWebhook = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -192,13 +194,18 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
           // Identify origin logic (Simplified MVP version)
           let origin = 'unknown';
           let originConfidence = 'auto';
-          let funnelStage = isFromMe ? 'replied' : 'first_contact';
+          let funnelStage = 'first_contact';
 
           const msgTextLower = content.toLowerCase();
 
+          const ctwaClid = extractMetaCtwaClidFromEvolutionMessage(msg?.message ?? msg);
+          if (ctwaClid) {
+            origin = 'meta_ads';
+          }
+
           // 1. Try to find matching origin event (e.g. from landing page)
-          const originEvent = await OriginEvent.findOne({ contactPhone }).sort({ capturedAt: -1 });
-          if (originEvent) {
+          const originEvent = await OriginEvent.findOne({ clientId: client.id, contactPhone }).sort({ capturedAt: -1 });
+          if (origin === 'unknown' && originEvent) {
             if (originEvent.utmSource?.toLowerCase().includes('facebook') || originEvent.utmSource?.toLowerCase().includes('meta')) {
               origin = 'meta_ads';
             } else if (originEvent.utmSource?.toLowerCase().includes('google')) {
@@ -227,13 +234,15 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
             lastInboundMessageAt: isFromMe ? undefined : new Date(msg.messageTimestamp * 1000),
             lastOutboundMessageAt: isFromMe ? new Date(msg.messageTimestamp * 1000) : undefined,
             lastMessageContent: previewContent,
-            unreadCount: isFromMe ? 0 : 1
+            unreadCount: isFromMe ? 0 : 1,
+            messageCount: 1
           });
         } else {
           // Update conversation
           const msgDate = new Date(msg.messageTimestamp * 1000);
           conversation.lastMessageAt = msgDate;
           conversation.lastMessageContent = previewContent;
+          conversation.messageCount = Number(conversation.messageCount || 0) + 1;
           
           if (isFromMe) {
             // Se for mensagem enviada por nós (empresa)
@@ -277,6 +286,10 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
           timestamp: new Date(msg.messageTimestamp * 1000),
           externalMessageId: msg.key.id
         });
+
+        setTimeout(() => {
+          void tryAutoScoreMql({ conversationId: conversation.id, clientId: client.id, io });
+        }, 0);
 
         // Notify frontend via WebSocket
         if (io) {

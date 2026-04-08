@@ -20,11 +20,42 @@ interface AnalyticsData {
     closed: number;
     lost: number;
   };
+  mql: {
+    avgScore: number | null;
+    scoredLeads: number;
+  };
+  topLeads: Array<{
+    _id: string;
+    contactName?: string;
+    contactPhone: string;
+    origin: 'meta_ads' | 'google_ads' | 'organic' | 'unknown';
+    funnelStage: 'first_contact' | 'replied' | 'qualified' | 'proposal' | 'scheduled' | 'closed' | 'lost';
+    mqlScore?: number;
+    mqlLevel?: 'cold' | 'warm' | 'hot';
+    lastMessageAt: string;
+  }>;
 }
 
 const Dashboard = () => {
   const { user, selectedClientId } = useAuthStore();
   const [data, setData] = useState<AnalyticsData | null>(null);
+
+  const getOriginLabel = (origin: AnalyticsData['topLeads'][number]['origin']) => {
+    if (origin === 'meta_ads') return 'Meta Ads';
+    if (origin === 'google_ads') return 'Google Ads';
+    if (origin === 'organic') return 'Orgânico';
+    return 'Desconhecido';
+  };
+
+  const getStageLabel = (stage: AnalyticsData['topLeads'][number]['funnelStage']) => {
+    if (stage === 'first_contact') return 'Primeiro contato';
+    if (stage === 'replied') return 'Respondeu';
+    if (stage === 'qualified') return 'Qualificado';
+    if (stage === 'proposal') return 'Proposta';
+    if (stage === 'scheduled') return 'Agendamento';
+    if (stage === 'closed') return 'Venda';
+    return 'Perdido';
+  };
 
   useEffect(() => {
     if (user && selectedClientId) {
@@ -57,6 +88,16 @@ const Dashboard = () => {
             <div className="rounded-xl bg-white p-6 shadow-sm border border-zinc-100 flex flex-col justify-center">
               <h3 className="text-sm font-medium text-zinc-500 uppercase tracking-wider mb-2">Total de Leads</h3>
               <p className="text-4xl font-bold text-primary">{data.totalLeads}</p>
+            </div>
+
+            <div className="rounded-xl bg-white p-6 shadow-sm border border-zinc-100 flex flex-col justify-center">
+              <h3 className="text-sm font-medium text-zinc-500 uppercase tracking-wider mb-2">MQL médio</h3>
+              <p className="text-4xl font-bold text-primary">
+                {data.mql.avgScore === null ? '—' : data.mql.avgScore}
+              </p>
+              <p className="text-xs text-zinc-500 mt-2">
+                Base: {data.mql.scoredLeads} lead{data.mql.scoredLeads === 1 ? '' : 's'} com MQL
+              </p>
             </div>
           </div>
 
@@ -118,6 +159,59 @@ const Dashboard = () => {
                 </div>
               </div>
             </div>
+          </div>
+
+          <div className="rounded-xl bg-white p-6 shadow-sm border border-zinc-100">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-zinc-800">Leads mais qualificados</h3>
+              <span className="text-xs text-zinc-500">Ordenado por MQL</span>
+            </div>
+
+            {data.topLeads.length === 0 ? (
+              <div className="text-sm text-zinc-500">Ainda não há leads para ranquear.</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="text-left text-zinc-500 border-b border-zinc-200">
+                      <th className="py-2 pr-4 font-medium">Lead</th>
+                      <th className="py-2 pr-4 font-medium">Telefone</th>
+                      <th className="py-2 pr-4 font-medium">Origem</th>
+                      <th className="py-2 pr-4 font-medium">Etapa</th>
+                      <th className="py-2 pr-4 font-medium">MQL</th>
+                      <th className="py-2 pr-0 font-medium">Última mensagem</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.topLeads.map((lead) => (
+                      <tr key={lead._id} className="border-b border-zinc-100 last:border-b-0">
+                        <td className="py-3 pr-4 text-zinc-800 font-medium whitespace-nowrap">
+                          {lead.contactName?.trim() ? lead.contactName : 'Sem nome'}
+                        </td>
+                        <td className="py-3 pr-4 text-zinc-600 whitespace-nowrap">{lead.contactPhone}</td>
+                        <td className="py-3 pr-4 text-zinc-600 whitespace-nowrap">{getOriginLabel(lead.origin)}</td>
+                        <td className="py-3 pr-4 text-zinc-600 whitespace-nowrap">{getStageLabel(lead.funnelStage)}</td>
+                        <td className="py-3 pr-4 whitespace-nowrap">
+                          {typeof lead.mqlScore === 'number' ? (
+                            <span className="inline-flex items-center gap-2">
+                              <span className="font-semibold text-zinc-800">{lead.mqlScore}</span>
+                              {lead.mqlLevel ? (
+                                <span className="text-xs text-zinc-500 uppercase">{lead.mqlLevel}</span>
+                              ) : null}
+                            </span>
+                          ) : (
+                            <span className="text-zinc-400">—</span>
+                          )}
+                        </td>
+                        <td className="py-3 pr-0 text-zinc-600 whitespace-nowrap">
+                          {lead.lastMessageAt ? new Date(lead.lastMessageAt).toLocaleString('pt-BR') : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         </div>
       ) : (

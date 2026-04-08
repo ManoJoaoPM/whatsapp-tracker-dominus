@@ -18,6 +18,7 @@ import conversationRoutes from './routes/conversations.js'
 import analyticsRoutes from './routes/analytics.js'
 import adminRoutes from './routes/admin.js'
 import clientsRoutes from './routes/clients.js'
+import mqlRoutes from './routes/mql.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -53,6 +54,7 @@ app.use('/api/conversations', conversationRoutes)
 app.use('/api/analytics', analyticsRoutes)
 app.use('/api/admin', adminRoutes)
 app.use('/api/clients', clientsRoutes)
+app.use('/api/mql', mqlRoutes)
 
 /**
  * health
