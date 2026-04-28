@@ -3,6 +3,7 @@ import Client from '../models/Client.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import OriginEvent from '../models/OriginEvent.js';
+import { getMediaMessageModel } from '../config/mediaDb.js';
 import { fetchMediaBase64, fetchSavedContactName } from '../services/evolutionService.js';
 import { tryAutoScoreMql } from '../services/mqlAutoScore.js';
 import { extractMetaCtwaClidFromEvolutionMessage } from '../services/originDetection.js';
@@ -112,13 +113,6 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
         let content = '';
         let mediaType = 'text';
         let mediaUrl = '';
-
-        console.log('--- MSG MEDIA DEBUG ---');
-        console.log('msg.message:', JSON.stringify(msg.message).substring(0, 500));
-        console.log('msg.base64 exists?', !!msg.base64);
-        console.log('msg.message.base64 exists?', !!msg.message?.base64);
-        console.log('msg.message.audioMessage.base64 exists?', !!msg.message?.audioMessage?.base64);
-        console.log('msg.message.documentWithCaptionMessage exists?', !!msg.message?.documentWithCaptionMessage);
 
         if (msg.message?.conversation) {
           content = msg.message.conversation;
@@ -276,7 +270,7 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
         }
 
         // Save message
-        const newMessage = await Message.create({
+        const messagePayload = {
           conversationId: conversation.id,
           clientId: client.id,
           direction: isFromMe ? 'outbound' : 'inbound',
@@ -285,7 +279,23 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
           mediaUrl: mediaUrl || undefined,
           timestamp: new Date(msg.messageTimestamp * 1000),
           externalMessageId: msg.key.id
-        });
+        };
+
+        const shouldStoreMediaInSecondary = mediaType === 'image' || mediaType === 'audio';
+        const primaryPayload = shouldStoreMediaInSecondary
+          ? { ...messagePayload, mediaUrl: undefined }
+          : messagePayload;
+
+        const newMessage = await Message.create(primaryPayload);
+
+        if (shouldStoreMediaInSecondary) {
+          const MediaMessage = await getMediaMessageModel();
+          if (MediaMessage) {
+            void MediaMessage.create(messagePayload).catch((err: any) => {
+              console.error('Media MongoDB save error:', err?.message || err);
+            });
+          }
+        }
 
         setTimeout(() => {
           void tryAutoScoreMql({ conversationId: conversation.id, clientId: client.id, io });
@@ -293,6 +303,9 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
 
         // Notify frontend via WebSocket
         if (io) {
+          const emittedMessage = shouldStoreMediaInSecondary
+            ? { ...(newMessage.toObject?.() ?? newMessage), mediaUrl: messagePayload.mediaUrl }
+            : newMessage;
           const roomSize = io.sockets?.adapter?.rooms?.get?.(client.id)?.size || 0;
           console.log('Emitting new_message', {
             room: client.id,
@@ -303,7 +316,7 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
           });
           io.to(client.id).emit('new_message', {
             conversation,
-            message: newMessage
+            message: emittedMessage
           });
         }
       }

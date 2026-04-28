@@ -2,8 +2,9 @@ import { Response } from 'express';
 import { ClientRequest } from '../middlewares/clientMiddleware.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
-import { sendMessage as evolutionSendMessage, fetchChatHistory } from '../services/evolutionService.js';
+import { sendMessage as evolutionSendMessage, fetchChatHistory, fetchMediaBase64 } from '../services/evolutionService.js';
 import { tryAutoScoreMql } from '../services/mqlAutoScore.js';
+import { getMediaMessageModel } from '../config/mediaDb.js';
 
 const FUNNEL_STAGES = [
   'first_contact',
@@ -206,14 +207,22 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
                 } else if (msg.message?.imageMessage) {
                   content = msg.message.imageMessage.caption || 'Imagem';
                   mediaType = 'image';
-                  if (msg.message.imageMessage.base64) {
-                    mediaUrl = `data:image/jpeg;base64,${msg.message.imageMessage.base64}`;
+                  let base64Data = msg.message.imageMessage.base64;
+                  if (!base64Data && externalMessageId) {
+                    base64Data = await fetchMediaBase64(client.whatsappInstance.instanceId, externalMessageId);
+                  }
+                  if (base64Data) {
+                    mediaUrl = base64Data.startsWith('data:') ? base64Data : `data:image/jpeg;base64,${base64Data}`;
                   }
                 } else if (msg.message?.audioMessage) {
                   content = 'Áudio';
                   mediaType = 'audio';
-                  if (msg.message.audioMessage.base64) {
-                    mediaUrl = `data:audio/ogg;base64,${msg.message.audioMessage.base64}`;
+                  let base64Data = msg.message.audioMessage.base64;
+                  if (!base64Data && externalMessageId) {
+                    base64Data = await fetchMediaBase64(client.whatsappInstance.instanceId, externalMessageId);
+                  }
+                  if (base64Data) {
+                    mediaUrl = base64Data.startsWith('data:') ? base64Data : `data:audio/ogg;base64,${base64Data}`;
                   }
                 } else if (msg.message?.documentMessage) {
                   content = msg.message.documentMessage.fileName || 'Documento';
@@ -230,7 +239,7 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
                   mediaType = 'null';
                 }
 
-                await Message.create({
+                const messagePayload = {
                   conversationId: conversation._id,
                   clientId: client._id,
                   direction: isFromMe ? 'outbound' : 'inbound',
@@ -239,7 +248,21 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
                   mediaUrl: mediaUrl || undefined,
                   timestamp: new Date((msg.messageTimestamp || Date.now() / 1000) * 1000),
                   externalMessageId
-                });
+                };
+
+                const shouldStoreMediaInSecondary = mediaType === 'image' || mediaType === 'audio';
+                const primaryPayload = shouldStoreMediaInSecondary
+                  ? { ...messagePayload, mediaUrl: undefined }
+                  : messagePayload;
+
+                await Message.create(primaryPayload);
+
+                if (shouldStoreMediaInSecondary) {
+                  const MediaMessage = await getMediaMessageModel();
+                  if (MediaMessage) {
+                    void MediaMessage.create(messagePayload).catch(() => {});
+                  }
+                }
               }
             }
 
@@ -267,7 +290,53 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
       void tryAutoScoreMql({ conversationId: conversation.id, clientId: req.currentClient.id, io });
     }, 0);
 
-    const messages = await Message.find({ conversationId: id }).sort({ timestamp: 1 });
+    const messages: any[] = await Message.find({ conversationId: id }).sort({ timestamp: 1 }).lean();
+
+    for (const m of messages) {
+      if (m?.mediaType === 'image' || m?.mediaType === 'audio') {
+        m.mediaUrl = undefined;
+      }
+    }
+
+    const mediaExternalIds = messages
+      .filter(
+        (m) =>
+          (m?.mediaType === 'image' || m?.mediaType === 'audio') &&
+          typeof m?.externalMessageId === 'string' &&
+          m.externalMessageId,
+      )
+      .map((m) => m.externalMessageId);
+
+    if (mediaExternalIds.length > 0) {
+      const MediaMessage = await getMediaMessageModel();
+      if (MediaMessage) {
+        const mediaDocs: Array<{ externalMessageId?: string; mediaUrl?: string }> = await MediaMessage.find({
+          conversationId: id,
+          externalMessageId: { $in: mediaExternalIds },
+        })
+          .select('externalMessageId mediaUrl')
+          .lean();
+
+        const mediaUrlByExternalId = new Map(
+          mediaDocs
+            .filter((d) => typeof d?.externalMessageId === 'string' && d.externalMessageId)
+            .map((d) => [String(d.externalMessageId), d.mediaUrl] as const),
+        );
+
+        for (const m of messages) {
+          if (
+            (m?.mediaType === 'image' || m?.mediaType === 'audio') &&
+            !m?.mediaUrl &&
+            typeof m?.externalMessageId === 'string' &&
+            m.externalMessageId
+          ) {
+            const u = mediaUrlByExternalId.get(m.externalMessageId);
+            if (u) m.mediaUrl = u;
+          }
+        }
+      }
+    }
+
     res.json(messages);
   } catch (error: any) {
     res.status(500).json({ message: error.message });

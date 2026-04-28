@@ -11,7 +11,7 @@ export interface IMessage extends Document {
   externalMessageId?: string;
 }
 
-const MessageSchema = new Schema<IMessage>({
+export const MessageSchema = new Schema<IMessage>({
   conversationId: { type: Schema.Types.ObjectId, ref: 'Conversation', required: true },
   clientId: { type: Schema.Types.ObjectId, ref: 'Client', required: true },
   direction: { type: String, enum: ['inbound', 'outbound'], required: true },
