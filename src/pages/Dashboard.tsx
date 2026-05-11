@@ -39,6 +39,11 @@ interface AnalyticsData {
 const Dashboard = () => {
   const { user, selectedClientId } = useAuthStore();
   const [data, setData] = useState<AnalyticsData | null>(null);
+  const [accounts, setAccounts] = useState<Array<{ _id: string; displayName?: string; phoneNumber?: string; instanceId: string }>>([]);
+  const [accountsLoading, setAccountsLoading] = useState(false);
+  const [filterWhatsAppAccountId, setFilterWhatsAppAccountId] = useState<string>('');
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
 
   const getOriginLabel = (origin: AnalyticsData['topLeads'][number]['origin']) => {
     if (origin === 'meta_ads') return 'Meta Ads';
@@ -59,15 +64,35 @@ const Dashboard = () => {
 
   useEffect(() => {
     if (user && selectedClientId) {
-      axios.get('/api/analytics', {
-        headers: { 
+      setAccountsLoading(true);
+      axios.get('/api/whatsapp-accounts', {
+        headers: {
           Authorization: `Bearer ${user.token}`,
-          'x-client-id': selectedClientId
-        }
-      }).then(res => setData(res.data))
-        .catch(err => console.error(err));
+          'x-client-id': selectedClientId,
+        },
+      })
+        .then((res) => setAccounts(Array.isArray(res.data) ? res.data : []))
+        .finally(() => setAccountsLoading(false));
     }
   }, [user, selectedClientId]);
+
+  useEffect(() => {
+    if (!user || !selectedClientId) return;
+    const params = new URLSearchParams();
+    if (filterWhatsAppAccountId) params.append('whatsappAccountId', filterWhatsAppAccountId);
+    if (from) params.append('from', from);
+    if (to) params.append('to', to);
+    const url = params.toString() ? `/api/analytics?${params.toString()}` : '/api/analytics';
+
+    axios.get(url, {
+      headers: {
+        Authorization: `Bearer ${user.token}`,
+        'x-client-id': selectedClientId,
+      },
+    })
+      .then((res) => setData(res.data))
+      .catch((err) => console.error(err));
+  }, [user, selectedClientId, filterWhatsAppAccountId, from, to]);
 
   if (!user) {
     return <Navigate to="/login" />;
@@ -79,6 +104,42 @@ const Dashboard = () => {
         <div>
           <h2 className="text-2xl font-bold text-zinc-800">Dashboard</h2>
           <p className="text-sm text-zinc-500 mt-1">Visão geral operacional do cliente.</p>
+        </div>
+        <div className="flex items-end gap-3">
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">WhatsApp</span>
+            <select
+              value={filterWhatsAppAccountId}
+              onChange={(e) => setFilterWhatsAppAccountId(e.target.value)}
+              disabled={accountsLoading}
+              className="bg-white border border-zinc-200 text-zinc-800 text-sm rounded-md focus:ring-primary focus:border-primary block p-2 outline-none disabled:opacity-50"
+            >
+              <option value="">Todos</option>
+              {accounts.map((a) => (
+                <option key={a._id} value={a._id}>
+                  {(a.displayName || 'WhatsApp') + (a.phoneNumber ? ` — ${a.phoneNumber}` : '')}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">De</span>
+            <input
+              type="date"
+              value={from}
+              onChange={(e) => setFrom(e.target.value)}
+              className="bg-white border border-zinc-200 text-zinc-800 text-sm rounded-md focus:ring-primary focus:border-primary block p-2 outline-none"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <span className="text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">Até</span>
+            <input
+              type="date"
+              value={to}
+              onChange={(e) => setTo(e.target.value)}
+              className="bg-white border border-zinc-200 text-zinc-800 text-sm rounded-md focus:ring-primary focus:border-primary block p-2 outline-none"
+            />
+          </div>
         </div>
       </header>
       

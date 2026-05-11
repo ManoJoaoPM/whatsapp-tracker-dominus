@@ -7,7 +7,7 @@
 [X] Tag de "Necessário Follow up" ou "Necessário Responder" para quando o lead não tiver respondido em +1 dia ou a empresa não tiver respondido em +1 dia
 [] Reconstruir a intereface para deixar na identidade visual e intuitiva
 [] Melhorar o painel de dashboard do cliente
-[] Verificar se está detectando a origem do lead
+[X] Verificar se está detectando a origem do lead
 [] Detectar a temperatura da conversa
 [] Definir gatilhos de etapa do lead ou interpretação da IA, para que ao atingir um gatilho, ele defina a etapa do lead ou interprete a mensagem da IA
 [] Disparar um pixel para o Facebook Pixel, para que ele registre a etapa do lead como conversão e envie os dados do lead que foi recebido do anúncio

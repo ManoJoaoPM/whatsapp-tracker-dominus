@@ -19,6 +19,8 @@ import analyticsRoutes from './routes/analytics.js'
 import adminRoutes from './routes/admin.js'
 import clientsRoutes from './routes/clients.js'
 import mqlRoutes from './routes/mql.js'
+import whatsappAccountsRoutes from './routes/whatsappAccounts.js'
+import integrationsRoutes from './routes/integrations.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -49,12 +51,14 @@ app.use('/api', (req: Request, res: Response, next: NextFunction) => {
  */
 app.use('/api/auth', authRoutes)
 app.use('/api/whatsapp', whatsappRoutes)
+app.use('/api/whatsapp-accounts', whatsappAccountsRoutes)
 app.use('/api/webhooks', webhookRoutes)
 app.use('/api/conversations', conversationRoutes)
 app.use('/api/analytics', analyticsRoutes)
 app.use('/api/admin', adminRoutes)
 app.use('/api/clients', clientsRoutes)
 app.use('/api/mql', mqlRoutes)
+app.use('/api/integrations', integrationsRoutes)
 
 /**
  * health

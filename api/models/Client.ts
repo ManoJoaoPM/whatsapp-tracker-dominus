@@ -11,6 +11,13 @@ export interface IClient extends Document {
     connectedAt?: Date;
   };
   mqlRules?: string;
+  metaAds?: {
+    pixelId?: string;
+    pageId?: string;
+    capiAccessTokenEnc?: string;
+    mqlTriggerLevel?: 'cold' | 'warm' | 'hot';
+    updatedAt?: Date;
+  };
 }
 
 const ClientSchema = new Schema<IClient>({
@@ -23,7 +30,14 @@ const ClientSchema = new Schema<IClient>({
     phoneNumber: { type: String },
     connectedAt: { type: Date }
   },
-  mqlRules: { type: String }
+  mqlRules: { type: String },
+  metaAds: {
+    pixelId: { type: String },
+    pageId: { type: String },
+    capiAccessTokenEnc: { type: String, select: false },
+    mqlTriggerLevel: { type: String, enum: ['cold', 'warm', 'hot'], default: 'hot' },
+    updatedAt: { type: Date },
+  },
 });
 
 export default mongoose.model<IClient>('Client', ClientSchema);

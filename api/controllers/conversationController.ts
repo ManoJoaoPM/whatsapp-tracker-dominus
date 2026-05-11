@@ -2,6 +2,7 @@ import { Response } from 'express';
 import { ClientRequest } from '../middlewares/clientMiddleware.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
+import WhatsAppAccount from '../models/WhatsAppAccount.js';
 import { sendMessage as evolutionSendMessage, fetchChatHistory, fetchMediaBase64 } from '../services/evolutionService.js';
 import { tryAutoScoreMql } from '../services/mqlAutoScore.js';
 import { getMediaMessageModel } from '../config/mediaDb.js';
@@ -28,6 +29,9 @@ const toCard = (conv: any) => ({
   lastMessageAt: new Date(conv.lastMessageAt).toISOString(),
   lastMessagePreview: conv.lastMessageContent || undefined,
   unreadCount: conv.unreadCount || 0,
+  mqlScore: conv.mqlScore,
+  mqlLevel: conv.mqlLevel,
+  metaAdData: conv.metaAdData,
 });
 
 const isFunnelStage = (value: any): value is FunnelStage => {
@@ -37,6 +41,10 @@ const isFunnelStage = (value: any): value is FunnelStage => {
 export const getConversations = async (req: ClientRequest, res: Response): Promise<void> => {
   try {
     const filter: any = { clientId: req.currentClient.id };
+
+    if (req.query.whatsappAccountId) {
+      filter.whatsappAccountId = req.query.whatsappAccountId;
+    }
     
     // Support filtering by origin or stage
     if (req.query.origin) {
@@ -71,6 +79,8 @@ export const getKanban = async (req: ClientRequest, res: Response): Promise<void
   try {
     const baseFilter: any = { clientId: req.currentClient.id };
 
+    const whatsappAccountId = typeof req.query.whatsappAccountId === 'string' ? req.query.whatsappAccountId : '';
+
     const origin = typeof req.query.origin === 'string' ? req.query.origin : '';
     const stage = typeof req.query.stage === 'string' ? req.query.stage : '';
     const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
@@ -80,6 +90,7 @@ export const getKanban = async (req: ClientRequest, res: Response): Promise<void
     const perStageRaw = typeof req.query.perStage === 'string' ? Number(req.query.perStage) : 50;
     const perStage = Number.isFinite(perStageRaw) ? Math.max(1, Math.min(200, perStageRaw)) : 50;
 
+    if (whatsappAccountId) baseFilter.whatsappAccountId = whatsappAccountId;
     if (origin) baseFilter.origin = origin;
     if (stage) baseFilter.funnelStage = stage;
 
@@ -125,7 +136,7 @@ export const getKanban = async (req: ClientRequest, res: Response): Promise<void
         const convs = await Conversation.find(stageFilter)
           .sort({ lastMessageAt: -1 })
           .limit(perStage)
-          .select('_id clientId contactPhone contactName origin funnelStage lastMessageAt lastMessageContent unreadCount')
+          .select('_id clientId contactPhone contactName origin funnelStage lastMessageAt lastMessageContent unreadCount mqlScore mqlLevel metaAdData')
           .lean();
         return [s, convs.map(toCard)] as const;
       })
@@ -161,10 +172,10 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
 
     // Sync history if not synced yet
     if (!conversation.historySynced) {
-      const client = req.currentClient;
-      if (client?.whatsappInstance?.instanceId && client.whatsappInstance.status === 'connected') {
+      const account = await WhatsAppAccount.findOne({ _id: conversation.whatsappAccountId, clientId: req.currentClient.id });
+      if (account?.instanceId && account.status === 'connected') {
         try {
-          const history = await fetchChatHistory(client.whatsappInstance.instanceId, conversation.contactPhone);
+          const history = await fetchChatHistory(account.instanceId, conversation.contactPhone);
           
           if (history && Array.isArray(history)) {
             let latestInboundDate = conversation.lastInboundMessageAt ? new Date(conversation.lastInboundMessageAt) : null;
@@ -209,7 +220,7 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
                   mediaType = 'image';
                   let base64Data = msg.message.imageMessage.base64;
                   if (!base64Data && externalMessageId) {
-                    base64Data = await fetchMediaBase64(client.whatsappInstance.instanceId, externalMessageId);
+                    base64Data = await fetchMediaBase64(account.instanceId, externalMessageId);
                   }
                   if (base64Data) {
                     mediaUrl = base64Data.startsWith('data:') ? base64Data : `data:image/jpeg;base64,${base64Data}`;
@@ -219,7 +230,7 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
                   mediaType = 'audio';
                   let base64Data = msg.message.audioMessage.base64;
                   if (!base64Data && externalMessageId) {
-                    base64Data = await fetchMediaBase64(client.whatsappInstance.instanceId, externalMessageId);
+                    base64Data = await fetchMediaBase64(account.instanceId, externalMessageId);
                   }
                   if (base64Data) {
                     mediaUrl = base64Data.startsWith('data:') ? base64Data : `data:audio/ogg;base64,${base64Data}`;
@@ -241,7 +252,8 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
 
                 const messagePayload = {
                   conversationId: conversation._id,
-                  clientId: client._id,
+                  clientId: req.currentClient._id,
+                  whatsappAccountId: account._id,
                   direction: isFromMe ? 'outbound' : 'inbound',
                   content,
                   mediaType,
@@ -278,9 +290,11 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
       }
     }
 
-    if (!conversation.messageCount) {
+    if (!conversation.messageCount || !conversation.inboundMessageCount) {
       const count = await Message.countDocuments({ conversationId: id });
+      const inboundCount = await Message.countDocuments({ conversationId: id, direction: 'inbound' });
       conversation.messageCount = count;
+      conversation.inboundMessageCount = inboundCount;
       if (!conversation.mqlLastScoredMessageCount) conversation.mqlLastScoredMessageCount = 0;
       await conversation.save();
     }
@@ -354,15 +368,15 @@ export const sendMessage = async (req: ClientRequest, res: Response): Promise<vo
       return;
     }
 
-    const client = req.currentClient;
-    if (!client?.whatsappInstance?.instanceId || client.whatsappInstance.status !== 'connected') {
+    const account = await WhatsAppAccount.findOne({ _id: conversation.whatsappAccountId, clientId: req.currentClient.id });
+    if (!account?.instanceId || account.status !== 'connected') {
       res.status(400).json({ message: 'WhatsApp not connected' });
       return;
     }
 
     // Send via Evolution API
     const evolutionResponse = await evolutionSendMessage(
-      client.whatsappInstance.instanceId,
+      account.instanceId,
       conversation.contactPhone,
       text
     );
@@ -370,7 +384,8 @@ export const sendMessage = async (req: ClientRequest, res: Response): Promise<vo
     // Save to DB
     const newMessage = await Message.create({
       conversationId: conversation.id,
-      clientId: client.id,
+      clientId: req.currentClient.id,
+      whatsappAccountId: account.id,
       direction: 'outbound',
       content: text,
       mediaType: 'text',
@@ -417,6 +432,13 @@ export const updateFunnelStage = async (req: ClientRequest, res: Response): Prom
       changedAt: new Date(),
       changedBy: req.user?.name || req.user?.email || 'user'
     });
+
+    if (stage === 'closed') {
+      conversation.mqlScore = 100;
+      conversation.mqlLevel = 'hot';
+      conversation.mqlSummary = 'Lead realizou a compra (Venda concluída). 100% qualificado.';
+      conversation.mqlUpdatedAt = new Date();
+    }
 
     await conversation.save();
 

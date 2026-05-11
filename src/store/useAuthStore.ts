@@ -24,10 +24,12 @@ export interface ClientEntity {
 interface AuthState {
   user: User | null;
   selectedClientId: string | null;
+  selectedWhatsAppAccountId: string | null;
   clients: ClientEntity[];
   setUser: (user: User | null) => void;
   setAuth: (user: User, token: string) => void;
   setSelectedClientId: (id: string | null) => void;
+  setSelectedWhatsAppAccountId: (id: string | null) => void;
   setClients: (clients: ClientEntity[]) => void;
   logout: () => void;
 }
@@ -37,12 +39,14 @@ export const useAuthStore = create<AuthState>()(
     (set) => ({
       user: null,
       selectedClientId: null,
+      selectedWhatsAppAccountId: null,
       clients: [],
       setUser: (user) => set({ user }),
       setAuth: (user, token) => set({ user: { ...user, token } }),
-      setSelectedClientId: (id) => set({ selectedClientId: id }),
+      setSelectedClientId: (id) => set({ selectedClientId: id, selectedWhatsAppAccountId: null }),
+      setSelectedWhatsAppAccountId: (id) => set({ selectedWhatsAppAccountId: id }),
       setClients: (clients) => set({ clients }),
-      logout: () => set({ user: null, selectedClientId: null, clients: [] }),
+      logout: () => set({ user: null, selectedClientId: null, selectedWhatsAppAccountId: null, clients: [] }),
     }),
     {
       name: 'auth-storage',

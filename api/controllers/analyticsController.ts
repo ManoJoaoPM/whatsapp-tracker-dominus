@@ -8,6 +8,28 @@ export const getAnalytics = async (req: ClientRequest, res: Response): Promise<v
 
     const filter: any = { clientId };
 
+    if (typeof req.query.whatsappAccountId === 'string' && req.query.whatsappAccountId) {
+      filter.whatsappAccountId = req.query.whatsappAccountId;
+    }
+
+    const from = typeof req.query.from === 'string' ? req.query.from : '';
+    const to = typeof req.query.to === 'string' ? req.query.to : '';
+
+    if (from || to) {
+      filter.lastMessageAt = {};
+      if (from) {
+        const d = new Date(from);
+        if (!Number.isNaN(d.getTime())) filter.lastMessageAt.$gte = d;
+      }
+      if (to) {
+        const d = new Date(to);
+        if (!Number.isNaN(d.getTime())) filter.lastMessageAt.$lte = d;
+      }
+      if (Object.keys(filter.lastMessageAt).length === 0) {
+        delete filter.lastMessageAt;
+      }
+    }
+
     if (req.query.startDate && req.query.endDate) {
       filter.createdAt = {
         $gte: new Date(req.query.startDate as string),

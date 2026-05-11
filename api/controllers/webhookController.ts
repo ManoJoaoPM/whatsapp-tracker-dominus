@@ -1,12 +1,15 @@
 import { Request, Response } from 'express';
 import Client from '../models/Client.js';
+import WhatsAppAccount from '../models/WhatsAppAccount.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import OriginEvent from '../models/OriginEvent.js';
+import MetaLeadLog from '../models/MetaLeadLog.js';
 import { getMediaMessageModel } from '../config/mediaDb.js';
 import { fetchMediaBase64, fetchSavedContactName } from '../services/evolutionService.js';
 import { tryAutoScoreMql } from '../services/mqlAutoScore.js';
-import { extractMetaCtwaClidFromEvolutionMessage } from '../services/originDetection.js';
+import { extractMetaCtwaClidFromEvolutionMessage, extractMetaSourceIdFromEvolutionMessage, extractMetaExternalAdReply } from '../services/originDetection.js';
+import { fetchMetaAdDetails } from '../services/metaConversions.js';
 
 export const handleEvolutionWebhook = async (req: Request, res: Response): Promise<void> => {
   try {
@@ -43,17 +46,19 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
 
     if (!instanceName) return;
 
-    // Find the client by instanceId
-    const client = await Client.findOne({ 'whatsappInstance.instanceId': instanceName });
-    if (!client) {
+    const account = await WhatsAppAccount.findOne({ instanceId: instanceName });
+    if (!account) {
       console.warn('Webhook received for unknown instance:', instanceName);
       return;
     }
 
+    const client = await Client.findById(account.clientId);
+    if (!client) return;
+
     const io = req.app.get('io');
 
     if (normalizedEvent === 'CONNECTION_UPDATE') {
-      const oldStatus = client.whatsappInstance?.status;
+      const oldStatus = account.status;
       let newStatus = oldStatus;
 
       // Tratar estados de conexão
@@ -67,8 +72,11 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
 
       // Só salva e emite se o status realmente mudou
       if (newStatus && newStatus !== oldStatus) {
-        client.whatsappInstance!.status = newStatus as 'connected' | 'disconnected' | 'pending';
-        await client.save();
+        account.status = newStatus as 'connected' | 'disconnected' | 'pending';
+        if (newStatus === 'connected' && !account.connectedAt) {
+          account.connectedAt = new Date();
+        }
+        await account.save();
         
         // Notify frontend
         if (io) {
@@ -79,7 +87,7 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
           //   status: newStatus,
           //   at: new Date().toISOString(),
           // });
-          io.to(client.id).emit('connection_update', { status: newStatus });
+          io.to(client.id).emit('connection_update', { whatsappAccountId: String(account._id), status: newStatus });
         }
       }
       return;
@@ -168,7 +176,7 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
         }
 
         // Find or create conversation
-        let conversation = await Conversation.findOne({ clientId: client.id, contactPhone });
+        let conversation = await Conversation.findOne({ clientId: client.id, whatsappAccountId: account.id, contactPhone });
 
         // Build preview text for lastMessageContent
         let previewContent = content;
@@ -193,8 +201,38 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
           const msgTextLower = content.toLowerCase();
 
           const ctwaClid = extractMetaCtwaClidFromEvolutionMessage(msg?.message ?? msg);
-          if (ctwaClid) {
+          const sourceId = extractMetaSourceIdFromEvolutionMessage(msg?.message ?? msg);
+          const externalAdReply = extractMetaExternalAdReply(msg?.message ?? msg);
+          
+          let metaAdData: any = undefined;
+
+          if (ctwaClid || sourceId || externalAdReply) {
             origin = 'meta_ads';
+            
+            metaAdData = {};
+            if (sourceId) metaAdData.sourceId = sourceId;
+            if (externalAdReply) {
+              if (externalAdReply.title) metaAdData.adTitle = externalAdReply.title;
+              if (externalAdReply.body) metaAdData.adBody = externalAdReply.body;
+              if (externalAdReply.mediaType) metaAdData.mediaType = externalAdReply.mediaType;
+              if (externalAdReply.thumbnailUrl) metaAdData.thumbnailUrl = externalAdReply.thumbnailUrl;
+              if (externalAdReply.sourceUrl) metaAdData.sourceUrl = externalAdReply.sourceUrl;
+              if (externalAdReply.adId) metaAdData.adId = externalAdReply.adId;
+            }
+
+            if (sourceId) {
+              const adDetails = await fetchMetaAdDetails({ clientId: client.id, sourceId });
+              if (adDetails) {
+                metaAdData = {
+                  ...metaAdData,
+                  ...adDetails
+                };
+              }
+            }
+            
+            if (Object.keys(metaAdData).length === 0) {
+              metaAdData = undefined;
+            }
           }
 
           // 1. Try to find matching origin event (e.g. from landing page)
@@ -216,12 +254,27 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
             }
           }
 
+          if (origin === 'meta_ads') {
+            try {
+              await MetaLeadLog.create({
+                clientId: client.id,
+                contactPhone,
+                rawPayload: msg?.message ?? msg
+              });
+            } catch (err) {
+              console.error('Error saving MetaLeadLog:', err);
+            }
+          }
+
           conversation = await Conversation.create({
             clientId: client.id,
+            whatsappAccountId: account.id,
             contactPhone,
             contactName: pushName,
             origin,
             originConfidence,
+            metaCtwaClid: ctwaClid || undefined,
+            metaAdData,
             funnelStage: funnelStage,
             funnelHistory: [{ stage: funnelStage, changedAt: new Date() }],
             lastMessageAt: new Date(msg.messageTimestamp * 1000),
@@ -229,7 +282,8 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
             lastOutboundMessageAt: isFromMe ? new Date(msg.messageTimestamp * 1000) : undefined,
             lastMessageContent: previewContent,
             unreadCount: isFromMe ? 0 : 1,
-            messageCount: 1
+            messageCount: 1,
+            inboundMessageCount: isFromMe ? 0 : 1
           });
         } else {
           // Update conversation
@@ -260,6 +314,7 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
 
           if (!isFromMe) {
             conversation.unreadCount += 1;
+            conversation.inboundMessageCount = (conversation.inboundMessageCount || 0) + 1;
             // Auto advance stage if it's first_contact
             if (conversation.funnelStage === 'first_contact') {
               conversation.funnelStage = 'replied';
@@ -273,6 +328,7 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
         const messagePayload = {
           conversationId: conversation.id,
           clientId: client.id,
+          whatsappAccountId: account.id,
           direction: isFromMe ? 'outbound' : 'inbound',
           content,
           mediaType,

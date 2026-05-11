@@ -3,6 +3,7 @@ import { ClientRequest } from '../middlewares/clientMiddleware.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import { getDefaultMqlRules, scoreConversationMql } from '../services/mqlService.js';
+import { trySendMetaMqlQualifiedConversion } from '../services/metaConversions.js';
 
 const buildTranscript = (messages: Array<{ direction: string; content: string; mediaType: string; timestamp: Date }>): string => {
   return messages
@@ -58,6 +59,8 @@ export const scoreConversation = async (req: ClientRequest, res: Response): Prom
 
     const result = await scoreConversationMql({ rules, transcript });
 
+    const previousLevel = conversation.mqlLevel;
+
     conversation.mqlScore = result.score;
     conversation.mqlLevel = result.level;
     conversation.mqlSummary = result.summary;
@@ -66,6 +69,15 @@ export const scoreConversation = async (req: ClientRequest, res: Response): Prom
     conversation.mqlModel = result.model;
     conversation.mqlRulesHash = result.rulesHash;
     await conversation.save();
+
+    if (conversation.origin === 'meta_ads') {
+      void trySendMetaMqlQualifiedConversion({
+        conversationId: conversation.id,
+        clientId: String(req.currentClient.id),
+        previousLevel,
+        nextLevel: conversation.mqlLevel,
+      });
+    }
 
     const io = req.app.get('io');
     if (io) {

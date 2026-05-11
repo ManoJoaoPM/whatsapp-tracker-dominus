@@ -9,9 +9,19 @@ import { useAuthStore } from '../store/useAuthStore';
 
 interface Conversation {
   _id: string;
+  whatsappAccountId: string;
   contactPhone: string;
   contactName: string;
   origin: string;
+  metaCtwaClid?: string;
+  metaAdData?: {
+    sourceId?: string;
+    campaignName?: string;
+    adsetName?: string;
+    adName?: string;
+    adTitle?: string;
+    thumbnailUrl?: string;
+  };
   funnelStage: string;
   lastMessageAt: string;
   lastMessageContent?: string;
@@ -77,8 +87,10 @@ const getAlertFlag = (conv: Conversation) => {
 };
 
 const Conversations = () => {
-  const { user, selectedClientId } = useAuthStore();
+  const { user, selectedClientId, selectedWhatsAppAccountId, setSelectedWhatsAppAccountId } = useAuthStore();
   const location = useLocation();
+  const [accounts, setAccounts] = useState<Array<{ _id: string; displayName?: string; phoneNumber?: string; instanceId: string; status: string }>>([]);
+  const [accountsLoading, setAccountsLoading] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConv, setActiveConv] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -113,11 +125,37 @@ const Conversations = () => {
 
   useEffect(() => {
     if (!user || !selectedClientId) return;
+    setAccountsLoading(true);
+    axios.get('/api/whatsapp-accounts', getHeaders())
+      .then((res) => {
+        const list = Array.isArray(res.data) ? res.data : [];
+        setAccounts(list);
+        const stillSelected = selectedWhatsAppAccountId && list.some((a: any) => a?._id === selectedWhatsAppAccountId);
+        if (!stillSelected) {
+          if (list.length === 1) setSelectedWhatsAppAccountId(list[0]._id);
+          else setSelectedWhatsAppAccountId(null);
+        }
+      })
+      .finally(() => setAccountsLoading(false));
+  }, [user, selectedClientId]);
+
+  useEffect(() => {
+    setActiveConv(null);
+    setMessages([]);
+  }, [selectedWhatsAppAccountId]);
+
+  useEffect(() => {
+    if (!user || !selectedClientId) return;
+    if (!selectedWhatsAppAccountId) {
+      setConversations([]);
+      return;
+    }
 
     const fetchConversations = async () => {
       try {
         let url = '/api/conversations';
         const params = new URLSearchParams();
+        params.append('whatsappAccountId', selectedWhatsAppAccountId);
         if (filterOrigin) params.append('origin', filterOrigin);
         if (filterStage) params.append('stage', filterStage);
         params.append('_t', String(Date.now()));
@@ -137,11 +175,12 @@ const Conversations = () => {
     };
 
     fetchConversations();
-  }, [user, selectedClientId, filterOrigin, filterStage]);
+  }, [user, selectedClientId, selectedWhatsAppAccountId, filterOrigin, filterStage]);
 
   useEffect(() => {
     if (!requestedConversationId) return;
     if (!user || !selectedClientId) return;
+    if (!selectedWhatsAppAccountId) return;
     if (openedRequestedRef.current === requestedConversationId) return;
 
     const fromList = conversations.find((c) => c._id === requestedConversationId);
@@ -160,7 +199,7 @@ const Conversations = () => {
             'Cache-Control': 'no-cache',
           },
         });
-        if (data?._id) {
+        if (data?._id && (!selectedWhatsAppAccountId || data?.whatsappAccountId === selectedWhatsAppAccountId)) {
           setConversations((prev) => {
             const exists = prev.some((c) => c._id === data._id);
             if (exists) return prev;
@@ -178,11 +217,13 @@ const Conversations = () => {
 
   useEffect(() => {
     if (!user || !selectedClientId) return;
+    if (!selectedWhatsAppAccountId) return;
 
     const intervalId = window.setInterval(async () => {
       try {
         let url = '/api/conversations';
         const params = new URLSearchParams();
+        params.append('whatsappAccountId', selectedWhatsAppAccountId);
         if (filterOrigin) params.append('origin', filterOrigin);
         if (filterStage) params.append('stage', filterStage);
         params.append('_t', String(Date.now()));
@@ -201,7 +242,7 @@ const Conversations = () => {
     }, 5000);
 
     return () => window.clearInterval(intervalId);
-  }, [user, selectedClientId, filterOrigin, filterStage]);
+  }, [user, selectedClientId, selectedWhatsAppAccountId, filterOrigin, filterStage]);
 
   useEffect(() => {
     if (!user || !selectedClientId) return;
@@ -247,6 +288,9 @@ const Conversations = () => {
     });
 
     newSocket.on('new_message', (data: { conversation: Conversation, message: Message }) => {
+      if (selectedWhatsAppAccountId && data?.conversation?.whatsappAccountId !== selectedWhatsAppAccountId) {
+        return;
+      }
       console.log('[socket] new_message received:', {
         conversationId: data?.conversation?._id,
         messageId: data?.message?._id,
@@ -276,6 +320,9 @@ const Conversations = () => {
     });
 
     newSocket.on('mql_updated', (data: { conversation: Conversation }) => {
+      if (selectedWhatsAppAccountId && data?.conversation?.whatsappAccountId !== selectedWhatsAppAccountId) {
+        return;
+      }
       setSocketEventsCount((v) => v + 1);
       setLastSocketEventAt(new Date().toISOString());
       setConversations(prev => {
@@ -296,7 +343,7 @@ const Conversations = () => {
     return () => {
       newSocket.disconnect();
     };
-  }, [user, selectedClientId]);
+  }, [user, selectedClientId, selectedWhatsAppAccountId]);
 
   const handleScoreMql = async () => {
     if (!activeConv) return;
@@ -446,12 +493,12 @@ const Conversations = () => {
   const handleStageChange = async (stage: string) => {
     if (!activeConv) return;
     try {
-      await axios.put(`/api/conversations/${activeConv._id}/stage`, 
+      const { data } = await axios.put(`/api/conversations/${activeConv._id}/stage`, 
         { stage },
         getHeaders()
       );
-      setActiveConv({ ...activeConv, funnelStage: stage });
-      setConversations(prev => prev.map(c => c._id === activeConv._id ? { ...c, funnelStage: stage } : c));
+      setActiveConv(data);
+      setConversations(prev => prev.map(c => c._id === activeConv._id ? data : c));
     } catch (error) {
       console.error('Error updating stage', error);
     }
@@ -537,9 +584,25 @@ const Conversations = () => {
           </div>
         </div>
         <div className="p-3 border-b border-zinc-200 bg-white flex flex-col gap-2">
+          <select
+            value={selectedWhatsAppAccountId || ''}
+            onChange={(e) => setSelectedWhatsAppAccountId(e.target.value || null)}
+            disabled={accountsLoading || accounts.length === 0}
+            className="text-sm border border-zinc-200 bg-zinc-50 rounded-md p-2 w-full focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary disabled:opacity-50"
+          >
+            <option value="" disabled>
+              {accountsLoading ? 'Carregando WhatsApps…' : accounts.length === 0 ? 'Nenhum WhatsApp adicionado' : 'Selecione um WhatsApp'}
+            </option>
+            {accounts.map((a) => (
+              <option key={a._id} value={a._id}>
+                {(a.displayName || 'WhatsApp') + (a.phoneNumber ? ` — ${a.phoneNumber}` : '')}
+              </option>
+            ))}
+          </select>
           <select 
             value={filterOrigin} 
             onChange={(e) => setFilterOrigin(e.target.value)}
+            disabled={!selectedWhatsAppAccountId}
             className="text-sm border border-zinc-200 bg-zinc-50 rounded-md p-2 w-full focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary"
           >
             <option value="">Todas as origens</option>
@@ -551,6 +614,7 @@ const Conversations = () => {
           <select 
             value={filterStage} 
             onChange={(e) => setFilterStage(e.target.value)}
+            disabled={!selectedWhatsAppAccountId}
             className="text-sm border border-zinc-200 bg-zinc-50 rounded-md p-2 w-full focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary"
           >
             <option value="">Todas as etapas</option>
@@ -560,6 +624,16 @@ const Conversations = () => {
           </select>
         </div>
         <div className="flex-1 overflow-y-auto">
+          {!selectedWhatsAppAccountId && accounts.length > 0 && (
+            <div className="p-8 text-center text-zinc-500">
+              Selecione um WhatsApp para carregar as conversas.
+            </div>
+          )}
+          {!selectedWhatsAppAccountId && accounts.length === 0 && !accountsLoading && (
+            <div className="p-8 text-center text-zinc-500">
+              Nenhum WhatsApp conectado. Vá em <a className="text-primary underline" href="/connection">Conexões</a> para adicionar.
+            </div>
+          )}
           {conversations.map(conv => {
             const alert = getAlertFlag(conv);
             return (
@@ -631,9 +705,26 @@ const Conversations = () => {
           <>
             {/* Chat Header */}
             <header className="p-4 bg-zinc-50 border-b border-zinc-200 flex justify-between items-center">
-              <div>
-                <h3 className="font-semibold text-zinc-800">{activeConv.contactName || activeConv.contactPhone}</h3>
-                <p className="text-xs text-zinc-500">{activeConv.contactPhone}</p>
+              <div className="flex items-center gap-3">
+                <div>
+                  <h3 className="font-semibold text-zinc-800">{activeConv.contactName || activeConv.contactPhone}</h3>
+                  <p className="text-xs text-zinc-500">{activeConv.contactPhone}</p>
+                </div>
+                {activeConv.metaAdData && (
+                  <div className="flex items-center gap-2 ml-4 pl-4 border-l border-zinc-200">
+                    {activeConv.metaAdData.thumbnailUrl && (
+                      <img src={activeConv.metaAdData.thumbnailUrl} alt="Ad Thumbnail" className="w-10 h-10 object-cover rounded-md shadow-sm border border-zinc-200" />
+                    )}
+                    <div className="flex flex-col">
+                      <span className="text-xs font-semibold text-zinc-700 truncate max-w-[200px]" title={activeConv.metaAdData.adTitle || activeConv.metaAdData.adName || activeConv.metaAdData.sourceId}>
+                        {activeConv.metaAdData.adTitle || activeConv.metaAdData.adName || 'Anúncio Meta'}
+                      </span>
+                      <span className="text-[10px] text-zinc-500 truncate max-w-[200px]" title={activeConv.metaAdData.campaignName}>
+                        {activeConv.metaAdData.campaignName || 'Campanha desconhecida'}
+                      </span>
+                    </div>
+                  </div>
+                )}
               </div>
               <div className="flex items-center gap-4">
                 <div className="flex items-center gap-2">

@@ -15,6 +15,8 @@ const DEFAULT_MQL_RULES_PTBR = `
 Objetivo: pontuar o lead em MQL de 0 a 100 baseado na conversa.
 
 Critérios (exemplo padrão — substitua pelas suas regras oficiais):
+- **Respondeu 4-5x**: Se o lead já enviou 4 ou mais mensagens na conversa, ele **é MQL**. Garanta que o score seja no mínimo 40.
+- **Venda Concluída**: Se a conversa indicar que o lead comprou, o score deve ser 100 (100% qualificado).
 - Intenção explícita de compra/contratação (+30)
 - Urgência / prazo definido (+15)
 - Fit básico (segmento/necessidade alinhada) (+15)
@@ -23,10 +25,10 @@ Critérios (exemplo padrão — substitua pelas suas regras oficiais):
 - Dados de contato/empresa e contexto suficientes (+10)
 - Sinais negativos (sem resposta, curiosidade genérica, fora do escopo, preço como única objeção) (-5 a -30)
 
-Mapeamento de nível:
+Mapeamento de nível (OBRIGATÓRIO):
 - cold: 0-39
 - warm: 40-69
-- hot: 70-100
+- hot: 70-100 (Todo lead acima de 70% de MQL será considerado como lead quente)
 
 Saída deve ser objetiva e baseada somente no que está escrito na conversa.
 `;

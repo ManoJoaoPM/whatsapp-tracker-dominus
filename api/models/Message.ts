@@ -3,6 +3,7 @@ import mongoose, { Schema, Document, Types } from 'mongoose';
 export interface IMessage extends Document {
   conversationId: Types.ObjectId;
   clientId: Types.ObjectId;
+  whatsappAccountId: Types.ObjectId;
   direction: 'inbound' | 'outbound';
   content: string;
   mediaType: 'text' | 'image' | 'audio' | 'document' | 'null';
@@ -14,6 +15,7 @@ export interface IMessage extends Document {
 export const MessageSchema = new Schema<IMessage>({
   conversationId: { type: Schema.Types.ObjectId, ref: 'Conversation', required: true },
   clientId: { type: Schema.Types.ObjectId, ref: 'Client', required: true },
+  whatsappAccountId: { type: Schema.Types.ObjectId, ref: 'WhatsAppAccount', required: true },
   direction: { type: String, enum: ['inbound', 'outbound'], required: true },
   content: { type: String, required: true },
   mediaType: { type: String, enum: ['text', 'image', 'audio', 'document', 'null'], default: 'text' },
