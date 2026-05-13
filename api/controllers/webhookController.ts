@@ -184,6 +184,11 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
         if (mediaType === 'audio') previewContent = '🎵 Áudio';
         if (mediaType === 'document') previewContent = '📄 Documento';
 
+        const ctwaClid = extractMetaCtwaClidFromEvolutionMessage(msg?.message ?? msg);
+        const sourceId = extractMetaSourceIdFromEvolutionMessage(msg?.message ?? msg);
+        const externalAdReply = extractMetaExternalAdReply(msg?.message ?? msg);
+        const isPotentialMetaLead = Boolean(ctwaClid || sourceId || externalAdReply);
+
         if (!conversation) {
           // Se for uma conversa nova e não temos o nome, tenta buscar na agenda da Evolution API
           if (!pushName) {
@@ -200,10 +205,6 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
 
           const msgTextLower = content.toLowerCase();
 
-          const ctwaClid = extractMetaCtwaClidFromEvolutionMessage(msg?.message ?? msg);
-          const sourceId = extractMetaSourceIdFromEvolutionMessage(msg?.message ?? msg);
-          const externalAdReply = extractMetaExternalAdReply(msg?.message ?? msg);
-          
           let metaAdData: any = undefined;
 
           if (ctwaClid || sourceId || externalAdReply) {
@@ -251,18 +252,6 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
               origin = 'meta_ads';
             } else if (msgTextLower.includes('google') || msgTextLower.includes('youtube') || msgTextLower.includes('pesquisa')) {
               origin = 'google_ads';
-            }
-          }
-
-          if (origin === 'meta_ads') {
-            try {
-              await MetaLeadLog.create({
-                clientId: client.id,
-                contactPhone,
-                rawPayload: msg?.message ?? msg
-              });
-            } catch (err) {
-              console.error('Error saving MetaLeadLog:', err);
             }
           }
 
@@ -322,6 +311,22 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
             }
           }
           await conversation.save();
+        }
+
+        if (!isFromMe && (isPotentialMetaLead || conversation.origin === 'meta_ads')) {
+          void MetaLeadLog.create({
+            clientId: client.id,
+            whatsappAccountId: account.id,
+            conversationId: conversation._id,
+            contactPhone,
+            externalMessageId: msg?.key?.id ? String(msg.key.id) : undefined,
+            isFromMe: Boolean(isFromMe),
+            ctwaClid: ctwaClid || undefined,
+            sourceId: sourceId || undefined,
+            rawPayload: msg,
+          }).catch((err: any) => {
+            console.error('Error saving MetaLeadLog:', err?.message || err);
+          });
         }
 
         // Save message
