@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import crypto from 'crypto';
 import Client from '../models/Client.js';
 import WhatsAppAccount from '../models/WhatsAppAccount.js';
 import Conversation from '../models/Conversation.js';
@@ -7,11 +8,48 @@ import OriginEvent from '../models/OriginEvent.js';
 import MetaLeadLog from '../models/MetaLeadLog.js';
 import { getMediaMessageModel } from '../config/mediaDb.js';
 import { fetchMediaBase64, fetchSavedContactName } from '../services/evolutionService.js';
-import { tryAutoScoreMql } from '../services/mqlAutoScore.js';
-import { extractMetaCtwaClidFromEvolutionMessage, extractMetaSourceIdFromEvolutionMessage, extractMetaExternalAdReply } from '../services/originDetection.js';
-import { fetchMetaAdDetails } from '../services/metaConversions.js';
+import { scheduleMqlScoring } from '../services/mqlAutoScore.js';
+import { enqueueMetaLeadSubmitted } from '../services/metaEventQueue.js';
+import {
+  extractMetaCtwaClidFromCloudMessage,
+  extractMetaCtwaClidFromEvolutionMessage,
+  extractMetaExternalAdReply,
+  extractMetaReferralFromCloudMessage,
+  extractMetaSourceIdFromCloudMessage,
+  extractMetaSourceIdFromEvolutionMessage,
+} from '../services/originDetection.js';
+import { buildMetaAdData, registerMetaClick } from '../services/attribution.js';
+
+const safeEqual = (a: string, b: string): boolean => {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+};
+
+let warnedMissingEvolutionToken = false;
+
+const isEvolutionWebhookAuthorized = (req: Request): boolean => {
+  const expected = String(process.env.EVOLUTION_WEBHOOK_TOKEN || '').trim();
+  if (!expected) {
+    if (!warnedMissingEvolutionToken) {
+      warnedMissingEvolutionToken = true;
+      console.warn('EVOLUTION_WEBHOOK_TOKEN is not set: the Evolution webhook is accepting unauthenticated requests');
+    }
+    return true;
+  }
+  const fromQuery = typeof req.query?.token === 'string' ? req.query.token : '';
+  const fromHeader = typeof req.headers['x-webhook-token'] === 'string' ? req.headers['x-webhook-token'] : '';
+  const provided = fromQuery || fromHeader;
+  return Boolean(provided) && safeEqual(provided, expected);
+};
 
 export const handleEvolutionWebhook = async (req: Request, res: Response): Promise<void> => {
+  if (!isEvolutionWebhookAuthorized(req)) {
+    res.sendStatus(401);
+    return;
+  }
+
   try {
     const { event, data, instance } = req.body;
 
@@ -209,31 +247,7 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
 
           if (ctwaClid || sourceId || externalAdReply) {
             origin = 'meta_ads';
-            
-            metaAdData = {};
-            if (sourceId) metaAdData.sourceId = sourceId;
-            if (externalAdReply) {
-              if (externalAdReply.title) metaAdData.adTitle = externalAdReply.title;
-              if (externalAdReply.body) metaAdData.adBody = externalAdReply.body;
-              if (externalAdReply.mediaType) metaAdData.mediaType = externalAdReply.mediaType;
-              if (externalAdReply.thumbnailUrl) metaAdData.thumbnailUrl = externalAdReply.thumbnailUrl;
-              if (externalAdReply.sourceUrl) metaAdData.sourceUrl = externalAdReply.sourceUrl;
-              if (externalAdReply.adId) metaAdData.adId = externalAdReply.adId;
-            }
-
-            if (sourceId) {
-              const adDetails = await fetchMetaAdDetails({ clientId: client.id, sourceId });
-              if (adDetails) {
-                metaAdData = {
-                  ...metaAdData,
-                  ...adDetails
-                };
-              }
-            }
-            
-            if (Object.keys(metaAdData).length === 0) {
-              metaAdData = undefined;
-            }
+            metaAdData = await buildMetaAdData({ clientId: client.id, sourceId, externalAdReply });
           }
 
           // 1. Try to find matching origin event (e.g. from landing page)
@@ -263,6 +277,18 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
             origin,
             originConfidence,
             metaCtwaClid: ctwaClid || undefined,
+            metaLastClickAt: ctwaClid || sourceId ? new Date(msg.messageTimestamp * 1000) : undefined,
+            metaClicks:
+              ctwaClid || sourceId
+                ? [
+                    {
+                      ctwaClid: ctwaClid || undefined,
+                      sourceId: sourceId || undefined,
+                      receivedAt: new Date(msg.messageTimestamp * 1000),
+                      externalMessageId: msg?.key?.id ? String(msg.key.id) : undefined,
+                    },
+                  ]
+                : [],
             metaAdData,
             funnelStage: funnelStage,
             funnelHistory: [{ stage: funnelStage, changedAt: new Date() }],
@@ -309,6 +335,17 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
               conversation.funnelStage = 'replied';
               conversation.funnelHistory.push({ stage: 'replied', changedAt: new Date() });
             }
+
+            // A returning contact may have clicked a new ad: the latest click wins
+            await registerMetaClick({
+              conversation,
+              clientId: client.id,
+              ctwaClid,
+              sourceId,
+              externalAdReply,
+              externalMessageId: msg?.key?.id ? String(msg.key.id) : undefined,
+              at: msgDate,
+            });
           }
           await conversation.save();
         }
@@ -358,9 +395,18 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
           }
         }
 
-        setTimeout(() => {
-          void tryAutoScoreMql({ conversationId: conversation.id, clientId: client.id, io });
-        }, 0);
+        // Early signal for Meta: the lead answered. Cheap check first, the queue re-validates everything.
+        if (
+          !isFromMe &&
+          conversation.origin === 'meta_ads' &&
+          !conversation.metaConversions?.leadSubmittedQueuedAt
+        ) {
+          void enqueueMetaLeadSubmitted({ conversationId: conversation.id, clientId: client.id }).catch((err) => {
+            console.error('[meta-events] could not enqueue LeadSubmitted', err?.message || err);
+          });
+        }
+
+        void scheduleMqlScoring({ conversationId: conversation.id, clientId: client.id });
 
         // Notify frontend via WebSocket
         if (io) {
@@ -386,6 +432,295 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
   } catch (error) {
     console.error('Webhook error:', error);
     // Even on error, we should return 200 so Evolution doesn't retry infinitely
+    if (!res.headersSent) {
+      res.status(200).json({ success: false });
+    }
+  }
+};
+
+const timingSafeEqualHex = (a: string, b: string) => {
+  const aBuf = Buffer.from(a);
+  const bBuf = Buffer.from(b);
+  if (aBuf.length !== bBuf.length) return false;
+  return crypto.timingSafeEqual(aBuf, bBuf);
+};
+
+export const verifyWhatsAppCloudWebhook = (req: Request, res: Response): void => {
+  const mode = typeof req.query?.['hub.mode'] === 'string' ? req.query['hub.mode'] : '';
+  const token = typeof req.query?.['hub.verify_token'] === 'string' ? req.query['hub.verify_token'] : '';
+  const challenge = typeof req.query?.['hub.challenge'] === 'string' ? req.query['hub.challenge'] : '';
+
+  if (mode === 'subscribe' && token && token === process.env.WHATSAPP_CLOUD_VERIFY_TOKEN) {
+    res.status(200).send(challenge);
+    return;
+  }
+
+  res.sendStatus(403);
+};
+
+export const handleWhatsAppCloudWebhook = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const appSecret = String(process.env.WHATSAPP_CLOUD_APP_SECRET || '').trim();
+    const signature = String(req.headers['x-hub-signature-256'] || '');
+
+    // Fail closed: without the app secret we cannot prove the request came from Meta
+    if (!appSecret) {
+      console.error('WHATSAPP_CLOUD_APP_SECRET is not set: rejecting WhatsApp Cloud webhook');
+      res.sendStatus(503);
+      return;
+    }
+
+    const rawBody = (req as any).rawBody as Buffer | undefined;
+    if (!rawBody || !signature.startsWith('sha256=')) {
+      res.sendStatus(401);
+      return;
+    }
+    const expected = `sha256=${crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex')}`;
+    if (!timingSafeEqualHex(signature, expected)) {
+      res.sendStatus(401);
+      return;
+    }
+
+    res.status(200).json({ success: true });
+
+    void (async () => {
+      const body = req.body;
+      const entries = Array.isArray(body?.entry) ? body.entry : [];
+
+      for (const entry of entries) {
+        const changes = Array.isArray(entry?.changes) ? entry.changes : [];
+        for (const change of changes) {
+          const value = change?.value;
+          const messages = Array.isArray(value?.messages) ? value.messages : [];
+          if (messages.length === 0) continue;
+
+          const phoneNumberId = value?.metadata?.phone_number_id ? String(value.metadata.phone_number_id) : '';
+          if (!phoneNumberId) continue;
+
+          const account = await WhatsAppAccount.findOne({ cloudPhoneNumberId: phoneNumberId });
+          if (!account) continue;
+
+          if (account.status !== 'connected') {
+            account.status = 'connected';
+            if (!account.connectedAt) account.connectedAt = new Date();
+            await account.save();
+          }
+
+          const client = await Client.findById(account.clientId);
+          if (!client) continue;
+
+          const io = req.app.get('io');
+
+          const contacts = Array.isArray(value?.contacts) ? value.contacts : [];
+          const nameByWaId = new Map<string, string>();
+          for (const c of contacts) {
+            const waId = typeof c?.wa_id === 'string' ? c.wa_id : '';
+            const name = typeof c?.profile?.name === 'string' ? c.profile.name : '';
+            if (waId) nameByWaId.set(waId, name);
+          }
+
+          for (const msg of messages) {
+            const contactPhone = typeof msg?.from === 'string' ? msg.from : '';
+            if (!contactPhone) continue;
+
+            let content = '';
+            let mediaType: 'text' | 'image' | 'audio' | 'document' | 'null' = 'text';
+            let mediaUrl = '';
+
+            const t = typeof msg?.type === 'string' ? msg.type : '';
+            if (t === 'text') {
+              content = typeof msg?.text?.body === 'string' ? msg.text.body : '';
+              mediaType = 'text';
+            } else if (t === 'image') {
+              content = typeof msg?.image?.caption === 'string' ? msg.image.caption : 'Imagem';
+              mediaType = 'image';
+            } else if (t === 'audio' || t === 'voice') {
+              content = 'Áudio';
+              mediaType = 'audio';
+            } else if (t === 'document') {
+              content = typeof msg?.document?.filename === 'string' ? msg.document.filename : 'Documento';
+              mediaType = 'document';
+            } else {
+              content = 'Mensagem não suportada';
+              mediaType = 'null';
+            }
+
+            let previewContent = content;
+            if (mediaType === 'image') previewContent = '📷 Foto';
+            if (mediaType === 'audio') previewContent = '🎵 Áudio';
+            if (mediaType === 'document') previewContent = '📄 Documento';
+
+            const pushName = nameByWaId.get(contactPhone) || '';
+            const timestampSeconds = Number(msg?.timestamp);
+            const msgDate = Number.isFinite(timestampSeconds) ? new Date(timestampSeconds * 1000) : new Date();
+
+            const ctwaClid = extractMetaCtwaClidFromCloudMessage(msg);
+            const sourceId = extractMetaSourceIdFromCloudMessage(msg);
+            const referral = extractMetaReferralFromCloudMessage(msg);
+            const isPotentialMetaLead = Boolean(ctwaClid || sourceId);
+            const externalMessageId = typeof msg?.id === 'string' ? msg.id : undefined;
+
+            let conversation = await Conversation.findOne({
+              clientId: client.id,
+              whatsappAccountId: account.id,
+              contactPhone,
+            });
+
+            if (!conversation) {
+              let origin: any = 'unknown';
+              let originConfidence: any = 'auto';
+              const funnelStage: any = 'first_contact';
+
+              let metaAdData: any = undefined;
+
+              if (ctwaClid || sourceId) {
+                origin = 'meta_ads';
+                metaAdData = await buildMetaAdData({ clientId: client.id, sourceId, externalAdReply: referral });
+              }
+
+              const originEvent = await OriginEvent.findOne({ clientId: client.id, contactPhone }).sort({ capturedAt: -1 });
+              if (origin === 'unknown' && originEvent) {
+                if (originEvent.utmSource?.toLowerCase().includes('facebook') || originEvent.utmSource?.toLowerCase().includes('meta')) {
+                  origin = 'meta_ads';
+                } else if (originEvent.utmSource?.toLowerCase().includes('google')) {
+                  origin = 'google_ads';
+                } else {
+                  origin = 'organic';
+                }
+              }
+
+              conversation = await Conversation.create({
+                clientId: client.id,
+                whatsappAccountId: account.id,
+                contactPhone,
+                contactName: pushName || undefined,
+                origin,
+                originConfidence,
+                metaCtwaClid: ctwaClid || undefined,
+                metaLastClickAt: ctwaClid || sourceId ? msgDate : undefined,
+                metaClicks:
+                  ctwaClid || sourceId
+                    ? [
+                        {
+                          ctwaClid: ctwaClid || undefined,
+                          sourceId: sourceId || undefined,
+                          receivedAt: msgDate,
+                          externalMessageId,
+                        },
+                      ]
+                    : [],
+                metaAdData,
+                funnelStage: funnelStage,
+                funnelHistory: [{ stage: funnelStage, changedAt: new Date() }],
+                lastMessageAt: msgDate,
+                lastInboundMessageAt: msgDate,
+                lastMessageContent: previewContent,
+                unreadCount: 1,
+                messageCount: 1,
+                inboundMessageCount: 1,
+              });
+            } else {
+              conversation.lastMessageAt = msgDate;
+              conversation.lastMessageContent = previewContent;
+              conversation.messageCount = Number(conversation.messageCount || 0) + 1;
+              if (!conversation.lastInboundMessageAt || msgDate > conversation.lastInboundMessageAt) {
+                conversation.lastInboundMessageAt = msgDate;
+              }
+
+              if (!conversation.contactName || conversation.contactName === conversation.contactPhone) {
+                if (pushName) conversation.contactName = pushName;
+              }
+
+              conversation.unreadCount = Number(conversation.unreadCount || 0) + 1;
+              conversation.inboundMessageCount = (conversation.inboundMessageCount || 0) + 1;
+              if (conversation.funnelStage === 'first_contact') {
+                conversation.funnelStage = 'replied';
+                conversation.funnelHistory.push({ stage: 'replied', changedAt: new Date() });
+              }
+
+              // A returning contact may have clicked a new ad: the latest click wins
+              await registerMetaClick({
+                conversation,
+                clientId: client.id,
+                ctwaClid,
+                sourceId,
+                externalAdReply: referral,
+                externalMessageId,
+                at: msgDate,
+              });
+              await conversation.save();
+            }
+
+            if (isPotentialMetaLead || conversation.origin === 'meta_ads') {
+              void MetaLeadLog.create({
+                clientId: client.id,
+                whatsappAccountId: account.id,
+                conversationId: conversation._id,
+                contactPhone,
+                externalMessageId: typeof msg?.id === 'string' ? msg.id : undefined,
+                isFromMe: false,
+                ctwaClid: ctwaClid || undefined,
+                sourceId: sourceId || undefined,
+                rawPayload: msg,
+              }).catch((err: any) => {
+                console.error('Error saving MetaLeadLog:', err?.message || err);
+              });
+            }
+
+            const messagePayload = {
+              conversationId: conversation.id,
+              clientId: client.id,
+              whatsappAccountId: account.id,
+              direction: 'inbound' as const,
+              content,
+              mediaType,
+              mediaUrl: mediaUrl || undefined,
+              timestamp: msgDate,
+              externalMessageId: typeof msg?.id === 'string' ? msg.id : undefined,
+            };
+
+            const shouldStoreMediaInSecondary = mediaType === 'image' || mediaType === 'audio';
+            const primaryPayload = shouldStoreMediaInSecondary
+              ? { ...messagePayload, mediaUrl: undefined }
+              : messagePayload;
+
+            const newMessage = await Message.create(primaryPayload);
+
+            if (shouldStoreMediaInSecondary) {
+              const MediaMessage = await getMediaMessageModel();
+              if (MediaMessage) {
+                void MediaMessage.create(messagePayload).catch((err: any) => {
+                  console.error('Media MongoDB save error:', err?.message || err);
+                });
+              }
+            }
+
+            // Early signal for Meta: the lead answered
+            if (conversation.origin === 'meta_ads' && !conversation.metaConversions?.leadSubmittedQueuedAt) {
+              void enqueueMetaLeadSubmitted({ conversationId: conversation.id, clientId: client.id }).catch((err) => {
+                console.error('[meta-events] could not enqueue LeadSubmitted', err?.message || err);
+              });
+            }
+
+            void scheduleMqlScoring({ conversationId: conversation.id, clientId: client.id });
+
+            if (io) {
+              const emittedMessage = shouldStoreMediaInSecondary
+                ? { ...(newMessage.toObject?.() ?? newMessage), mediaUrl: messagePayload.mediaUrl }
+                : newMessage;
+              io.to(client.id).emit('new_message', {
+                conversation,
+                message: emittedMessage,
+              });
+            }
+          }
+        }
+      }
+    })().catch((err) => {
+      console.error('WhatsApp Cloud webhook async error:', err);
+    });
+  } catch (error) {
+    console.error('WhatsApp Cloud webhook error:', error);
     if (!res.headersSent) {
       res.status(200).json({ success: false });
     }

@@ -7,6 +7,16 @@ const evolutionHeaders = () => ({
   apikey: EVOLUTION_GLOBAL_API_KEY,
 });
 
+/**
+ * URL that Evolution calls for each event. When EVOLUTION_WEBHOOK_TOKEN is set the
+ * token is appended so the webhook handler can reject requests that do not carry it.
+ */
+export const buildEvolutionWebhookUrl = (): string => {
+  const base = `${String(process.env.APP_URL || '').replace(/\/$/, '')}/api/webhooks/evolution`;
+  const token = String(process.env.EVOLUTION_WEBHOOK_TOKEN || '').trim();
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+};
+
 const formatEvolutionError = (error: any) => {
   const status = error?.response?.status;
   const data = error?.response?.data;

@@ -1,10 +1,12 @@
 import { Response } from 'express';
+import mongoose from 'mongoose';
 import { ClientRequest } from '../middlewares/clientMiddleware.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import WhatsAppAccount from '../models/WhatsAppAccount.js';
 import { sendMessage as evolutionSendMessage, fetchChatHistory, fetchMediaBase64 } from '../services/evolutionService.js';
-import { tryAutoScoreMql } from '../services/mqlAutoScore.js';
+import { scheduleMqlScoring } from '../services/mqlAutoScore.js';
+import { enqueueMetaPurchase } from '../services/metaEventQueue.js';
 import { getMediaMessageModel } from '../config/mediaDb.js';
 
 const FUNNEL_STAGES = [
@@ -32,7 +34,25 @@ const toCard = (conv: any) => ({
   mqlScore: conv.mqlScore,
   mqlLevel: conv.mqlLevel,
   metaAdData: conv.metaAdData,
+  saleValue: conv.saleValue,
+  saleValueSuggested: conv.saleValueSuggested,
 });
+
+const MAX_SALE_VALUE = 1_000_000_000;
+
+/** undefined = not informed, null = informed but invalid, number = valid amount (> 0) */
+const parseSaleValue = (raw: unknown): number | null | undefined => {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const n = typeof raw === 'number' ? raw : Number(String(raw).replace(',', '.'));
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_SALE_VALUE) return null;
+  return Math.round(n * 100) / 100;
+};
+
+const enqueuePurchase = (conversationId: string, clientId: string) => {
+  void enqueueMetaPurchase({ conversationId, clientId }).catch((err) => {
+    console.error('[meta-events] could not enqueue Purchase', { conversationId, error: err?.message || err });
+  });
+};
 
 const isFunnelStage = (value: any): value is FunnelStage => {
   return FUNNEL_STAGES.includes(value);
@@ -77,9 +97,14 @@ export const getConversationById = async (req: ClientRequest, res: Response): Pr
 
 export const getKanban = async (req: ClientRequest, res: Response): Promise<void> => {
   try {
-    const baseFilter: any = { clientId: req.currentClient.id };
+    // ObjectIds, not strings: Mongoose does not cast the filters of aggregate() pipelines
+    const baseFilter: any = { clientId: req.currentClient._id };
 
     const whatsappAccountId = typeof req.query.whatsappAccountId === 'string' ? req.query.whatsappAccountId : '';
+    if (whatsappAccountId && !mongoose.isValidObjectId(whatsappAccountId)) {
+      res.status(400).json({ message: 'Invalid whatsappAccountId' });
+      return;
+    }
 
     const origin = typeof req.query.origin === 'string' ? req.query.origin : '';
     const stage = typeof req.query.stage === 'string' ? req.query.stage : '';
@@ -90,7 +115,7 @@ export const getKanban = async (req: ClientRequest, res: Response): Promise<void
     const perStageRaw = typeof req.query.perStage === 'string' ? Number(req.query.perStage) : 50;
     const perStage = Number.isFinite(perStageRaw) ? Math.max(1, Math.min(200, perStageRaw)) : 50;
 
-    if (whatsappAccountId) baseFilter.whatsappAccountId = whatsappAccountId;
+    if (whatsappAccountId) baseFilter.whatsappAccountId = new mongoose.Types.ObjectId(whatsappAccountId);
     if (origin) baseFilter.origin = origin;
     if (stage) baseFilter.funnelStage = stage;
 
@@ -136,7 +161,7 @@ export const getKanban = async (req: ClientRequest, res: Response): Promise<void
         const convs = await Conversation.find(stageFilter)
           .sort({ lastMessageAt: -1 })
           .limit(perStage)
-          .select('_id clientId contactPhone contactName origin funnelStage lastMessageAt lastMessageContent unreadCount mqlScore mqlLevel metaAdData')
+          .select('_id clientId contactPhone contactName origin funnelStage lastMessageAt lastMessageContent unreadCount mqlScore mqlLevel metaAdData saleValue saleValueSuggested')
           .lean();
         return [s, convs.map(toCard)] as const;
       })
@@ -300,9 +325,7 @@ export const getMessages = async (req: ClientRequest, res: Response): Promise<vo
     }
 
     const io = req.app.get('io');
-    setTimeout(() => {
-      void tryAutoScoreMql({ conversationId: conversation.id, clientId: req.currentClient.id, io });
-    }, 0);
+    void scheduleMqlScoring({ conversationId: conversation.id, clientId: req.currentClient.id });
 
     const messages: any[] = await Message.find({ conversationId: id }).sort({ timestamp: 1 }).lean();
 
@@ -400,9 +423,7 @@ export const sendMessage = async (req: ClientRequest, res: Response): Promise<vo
     await conversation.save();
 
     const io = req.app.get('io');
-    setTimeout(() => {
-      void tryAutoScoreMql({ conversationId: conversation.id, clientId: req.currentClient.id, io });
-    }, 0);
+    void scheduleMqlScoring({ conversationId: conversation.id, clientId: req.currentClient.id });
 
     res.json(newMessage);
   } catch (error: any) {
@@ -417,6 +438,12 @@ export const updateFunnelStage = async (req: ClientRequest, res: Response): Prom
 
     if (!isFunnelStage(stage)) {
       res.status(400).json({ message: 'Invalid funnel stage' });
+      return;
+    }
+
+    const saleValue = parseSaleValue(req.body?.saleValue);
+    if (saleValue === null) {
+      res.status(400).json({ message: 'Invalid saleValue' });
       return;
     }
 
@@ -438,9 +465,57 @@ export const updateFunnelStage = async (req: ClientRequest, res: Response): Prom
       conversation.mqlLevel = 'hot';
       conversation.mqlSummary = 'Lead realizou a compra (Venda concluída). 100% qualificado.';
       conversation.mqlUpdatedAt = new Date();
+
+      if (saleValue !== undefined) {
+        conversation.saleValue = saleValue;
+        conversation.saleValueAt = new Date();
+      }
     }
 
     await conversation.save();
+
+    // A sale closed by a person is the strongest confirmation: let the qualification pipeline see it
+    if (stage === 'closed') {
+      void scheduleMqlScoring({ conversationId: conversation.id, clientId: String(req.currentClient.id) });
+      enqueuePurchase(conversation.id, String(req.currentClient.id));
+    }
+
+    const io = req.app.get('io');
+    if (io) {
+      io.to(String(req.currentClient.id)).emit('conversation_updated', { conversation: toCard(conversation) });
+    }
+    res.json(conversation);
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+/**
+ * Sets (or corrects) the value of a closed sale. If the sale is already closed, the Purchase
+ * event is sent now; once it was sent, changing the value does not change what Meta received.
+ */
+export const updateSaleValue = async (req: ClientRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const saleValue = parseSaleValue(req.body?.saleValue);
+    if (saleValue === undefined || saleValue === null) {
+      res.status(400).json({ message: 'saleValue must be a number greater than zero' });
+      return;
+    }
+
+    const conversation = await Conversation.findOne({ _id: id, clientId: req.currentClient.id });
+    if (!conversation) {
+      res.status(404).json({ message: 'Conversation not found' });
+      return;
+    }
+
+    conversation.saleValue = saleValue;
+    conversation.saleValueAt = new Date();
+    await conversation.save();
+
+    if (conversation.funnelStage === 'closed') {
+      enqueuePurchase(conversation.id, String(req.currentClient.id));
+    }
 
     const io = req.app.get('io');
     if (io) {

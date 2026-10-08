@@ -4,7 +4,18 @@
 import './config/env.js';
 import app from './app.js';
 import connectDB from './config/db.js';
+import { getJwtSecret, verifyAuthToken } from './config/jwt.js';
+import { startMetaEventWorker } from './services/metaEventQueue.js';
+import { startMqlWorker } from './services/mqlAutoScore.js';
+import User from './models/User.js';
+import Client from './models/Client.js';
 import { Server } from 'socket.io';
+import mongoose from 'mongoose';
+
+/**
+ * fail fast when required secrets are missing
+ */
+getJwtSecret();
 
 /**
  * connect to database
@@ -30,24 +41,52 @@ const io = new Server(server, {
   }
 });
 
-io.on('connection', (socket) => {
-  const { token, clientId } = socket.handshake.auth || {};
-  console.log(`[socket] Client connected: ${socket.id}, token: ${!!token}, clientId: ${clientId}`);
-  
-  socket.on('join', (roomClientId, ack) => {
-    // Check if the requested room matches the auth clientId
-    if (clientId && roomClientId !== clientId) {
-      console.warn(`[socket] Client ${socket.id} attempted to join room ${roomClientId} but is authorized for ${clientId}`);
+// Only authenticated users may open a socket
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    if (typeof token !== 'string' || !token) {
+      return next(new Error('unauthorized'));
     }
+    const { id } = verifyAuthToken(token);
+    const user = await User.findById(id).select('_id');
+    if (!user) return next(new Error('unauthorized'));
+    socket.data.userId = String(user._id);
+    next();
+  } catch {
+    next(new Error('unauthorized'));
+  }
+});
 
-    const room = String(roomClientId);
-    socket.join(room);
+io.on('connection', (socket) => {
+  const userId: string = socket.data.userId;
+  console.log(`[socket] Client connected: ${socket.id}, user: ${userId}`);
 
-    const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
-    console.log(`Socket ${socket.id} joined room ${room} (size=${roomSize})`);
+  socket.on('join', async (roomClientId, ack) => {
+    const reply = (payload: Record<string, unknown>) => {
+      if (typeof ack === 'function') ack(payload);
+    };
 
-    if (typeof ack === 'function') {
-      ack({ ok: true, room, socketId: socket.id, roomSize });
+    try {
+      const room = String(roomClientId || '');
+      // The room is the clientId: the user must own that client
+      const owns = mongoose.isValidObjectId(room)
+        ? await Client.exists({ _id: room, userId })
+        : null;
+
+      if (!owns) {
+        console.warn(`[socket] Socket ${socket.id} (user ${userId}) denied access to room ${room}`);
+        reply({ ok: false, error: 'forbidden' });
+        return;
+      }
+
+      socket.join(room);
+      const roomSize = io.sockets.adapter.rooms.get(room)?.size || 0;
+      console.log(`Socket ${socket.id} joined room ${room} (size=${roomSize})`);
+      reply({ ok: true, room, socketId: socket.id, roomSize });
+    } catch (error) {
+      console.error('[socket] join error', error);
+      reply({ ok: false, error: 'internal' });
     }
   });
 
@@ -58,6 +97,12 @@ io.on('connection', (socket) => {
 
 // Attach io to app so routes can use it
 app.set('io', io);
+
+// Delivers (and retries) the events queued for Meta
+startMetaEventWorker();
+
+// Scores conversations once they have been quiet for a while, and re-evaluates silent leads
+startMqlWorker(io);
 
 /**
  * close server

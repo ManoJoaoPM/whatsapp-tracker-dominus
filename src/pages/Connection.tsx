@@ -3,6 +3,7 @@ import axios from 'axios';
 import { CheckCircle, Plus, QrCode, RefreshCcw, Smartphone, Unplug, List } from 'lucide-react';
 import { useAuthStore } from '../store/useAuthStore';
 import MetaLogsModal from '../components/MetaLogsModal';
+import MqlCriteriaCard from '../components/MqlCriteriaCard';
 
 type WhatsAppStatus = 'connected' | 'disconnected' | 'pending';
 
@@ -60,12 +61,19 @@ const Connection = () => {
   const [metaTestCode, setMetaTestCode] = useState('');
   const [metaTestStatusText, setMetaTestStatusText] = useState<string | null>(null);
   const [metaTestDebug, setMetaTestDebug] = useState<any>(null);
-  const [metaTestEventName, setMetaTestEventName] = useState<'QualifiedLead' | 'Lead' | 'Purchase'>('QualifiedLead');
+  const [metaTestEventName, setMetaTestEventName] = useState<'QualifiedLead' | 'LeadSubmitted' | 'Purchase'>('QualifiedLead');
   const [metaTestActionSource, setMetaTestActionSource] = useState<'website' | 'chat' | 'physical_store' | 'business_messaging'>('business_messaging');
   const [metaTestEventSourceUrl, setMetaTestEventSourceUrl] = useState('https://meu-tintim.com.br');
   const [metaTestCtwaClid, setMetaTestCtwaClid] = useState('');
   const [metaTestPhone, setMetaTestPhone] = useState('5511999999999');
   const [metaTriggerLevel, setMetaTriggerLevel] = useState<'cold' | 'warm' | 'hot'>('hot');
+  const [metaSendUntracked, setMetaSendUntracked] = useState(false);
+  const [metaEvents, setMetaEvents] = useState({
+    leadSubmitted: { enabled: false, minInbound: 2 },
+    qualifiedLead: { enabled: true },
+    purchase: { enabled: false },
+  });
+  const [metaCurrency, setMetaCurrency] = useState('BRL');
   const [logsModalOpen, setLogsModalOpen] = useState(false);
 
   const headers = useMemo(() => {
@@ -113,11 +121,25 @@ const Connection = () => {
       setMetaPageId(String((integration as any).pageId || ''));
       setMetaHasToken(Boolean(integration.hasAccessToken));
       setMetaTriggerLevel((integration.mqlTriggerLevel as any) || 'hot');
+      setMetaSendUntracked(Boolean((integration as any).sendUntracked));
+      const events = (integration as any).events;
+      if (events) {
+        setMetaEvents({
+          leadSubmitted: {
+            enabled: Boolean(events.leadSubmitted?.enabled),
+            minInbound: Number(events.leadSubmitted?.minInbound) || 2,
+          },
+          qualifiedLead: { enabled: events.qualifiedLead?.enabled !== false },
+          purchase: { enabled: Boolean(events.purchase?.enabled) },
+        });
+      }
+      setMetaCurrency(String((integration as any).currency || 'BRL'));
     } catch {
       setMetaPixelId('');
       setMetaPageId('');
       setMetaHasToken(false);
       setMetaTriggerLevel('hot');
+      setMetaSendUntracked(false);
     } finally {
       setMetaLoading(false);
     }
@@ -133,6 +155,9 @@ const Connection = () => {
       if (metaPageId.trim()) payload.pageId = metaPageId.trim();
       if (metaAccessToken.trim()) payload.accessToken = metaAccessToken.trim();
       payload.mqlTriggerLevel = metaTriggerLevel;
+      payload.sendUntracked = metaSendUntracked;
+      payload.events = metaEvents;
+      payload.currency = metaCurrency.trim().toUpperCase();
 
       const { data } = await axios.put('/api/integrations/meta', payload, headers);
       if (data?.pixelId) setMetaPixelId(String(data.pixelId || ''));
@@ -535,6 +560,105 @@ const Connection = () => {
                     <option value="hot">Hot</option>
                   </select>
                 </div>
+
+                <div className="lg:col-span-2">
+                  <label className="flex items-start gap-3 text-sm text-zinc-700 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={metaSendUntracked}
+                      onChange={(e) => setMetaSendUntracked(e.target.checked)}
+                      disabled={metaLoading || metaSaving}
+                      className="mt-0.5 h-4 w-4 rounded border-zinc-300"
+                    />
+                    <span>
+                      Enviar também leads Meta sem <code className="text-xs">ctwa_clid</code>
+                      <span className="block text-xs text-zinc-500 mt-0.5">
+                        Desligado (recomendado): o Meta não consegue ligar esses eventos a um clique, o que só reduz a qualidade de correspondência.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+
+                <div className="lg:col-span-2 border-t border-zinc-100 pt-4">
+                  <div className="text-xs font-medium text-zinc-700 mb-1">Eventos enviados ao Meta</div>
+                  <p className="text-xs text-zinc-500 mb-3">
+                    Cada etapa vira um sinal para o algoritmo. No Gerenciador de Anúncios, otimize para o evento mais próximo da venda que ainda tenha volume
+                    (em geral, cerca de 50 eventos por semana por conjunto de anúncios). Com pouco volume, comece por <code className="text-[11px]">LeadSubmitted</code> e suba depois.
+                  </p>
+
+                  <div className="space-y-3">
+                    <label className="flex items-start gap-3 text-sm text-zinc-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={metaEvents.leadSubmitted.enabled}
+                        onChange={(e) => setMetaEvents((p) => ({ ...p, leadSubmitted: { ...p.leadSubmitted, enabled: e.target.checked } }))}
+                        disabled={metaLoading || metaSaving}
+                        className="mt-0.5 h-4 w-4 rounded border-zinc-300"
+                      />
+                      <span className="flex-1">
+                        <code className="text-xs font-semibold">LeadSubmitted</code> — o lead respondeu
+                        <span className="block text-xs text-zinc-500 mt-0.5">Sinal inicial e de maior volume. Não depende da IA.</span>
+                      </span>
+                      <span className="flex items-center gap-1 text-xs text-zinc-500 shrink-0">
+                        após
+                        <input
+                          type="number"
+                          min={1}
+                          max={20}
+                          value={metaEvents.leadSubmitted.minInbound}
+                          onChange={(e) =>
+                            setMetaEvents((p) => ({
+                              ...p,
+                              leadSubmitted: { ...p.leadSubmitted, minInbound: Math.max(1, Math.min(20, Number(e.target.value) || 1)) },
+                            }))
+                          }
+                          disabled={metaLoading || metaSaving || !metaEvents.leadSubmitted.enabled}
+                          className="w-14 rounded-lg border border-zinc-200 px-2 py-1 text-xs outline-none"
+                        />
+                        mensagens
+                      </span>
+                    </label>
+
+                    <label className="flex items-start gap-3 text-sm text-zinc-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={metaEvents.qualifiedLead.enabled}
+                        onChange={(e) => setMetaEvents((p) => ({ ...p, qualifiedLead: { enabled: e.target.checked } }))}
+                        disabled={metaLoading || metaSaving}
+                        className="mt-0.5 h-4 w-4 rounded border-zinc-300"
+                      />
+                      <span>
+                        <code className="text-xs font-semibold">QualifiedLead</code> — a IA qualificou o lead
+                        <span className="block text-xs text-zinc-500 mt-0.5">Usa o nível escolhido acima e só sai depois da confirmação da IA.</span>
+                      </span>
+                    </label>
+
+                    <label className="flex items-start gap-3 text-sm text-zinc-700 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={metaEvents.purchase.enabled}
+                        onChange={(e) => setMetaEvents((p) => ({ ...p, purchase: { enabled: e.target.checked } }))}
+                        disabled={metaLoading || metaSaving}
+                        className="mt-0.5 h-4 w-4 rounded border-zinc-300"
+                      />
+                      <span className="flex-1">
+                        <code className="text-xs font-semibold">Purchase</code> — venda concluída, com valor
+                        <span className="block text-xs text-zinc-500 mt-0.5">
+                          Só sai quando uma pessoa move o lead para "Venda concluída" e informa o valor. É o que permite otimizar por retorno sobre o investimento.
+                        </span>
+                      </span>
+                      <span className="flex items-center gap-1 text-xs text-zinc-500 shrink-0">
+                        moeda
+                        <input
+                          value={metaCurrency}
+                          onChange={(e) => setMetaCurrency(e.target.value.toUpperCase().slice(0, 3))}
+                          disabled={metaLoading || metaSaving || !metaEvents.purchase.enabled}
+                          className="w-14 rounded-lg border border-zinc-200 px-2 py-1 text-xs uppercase outline-none"
+                        />
+                      </span>
+                    </label>
+                  </div>
+                </div>
               </div>
 
               <div className="flex items-center justify-between mt-4 gap-3">
@@ -571,7 +695,7 @@ const Connection = () => {
                     disabled={metaLoading || metaSaving}
                   >
                     <option value="QualifiedLead">QualifiedLead</option>
-                    <option value="Lead">Lead</option>
+                    <option value="LeadSubmitted">LeadSubmitted</option>
                     <option value="Purchase">Purchase</option>
                   </select>
                   <input
@@ -661,6 +785,9 @@ const Connection = () => {
             </div>
           </div>
         </div>
+      </div>
+      <div className="mt-6">
+        <MqlCriteriaCard />
       </div>
       <MetaLogsModal isOpen={logsModalOpen} onClose={() => setLogsModalOpen(false)} />
     </div>

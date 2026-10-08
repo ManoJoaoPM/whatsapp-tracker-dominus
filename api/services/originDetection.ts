@@ -80,3 +80,27 @@ export function extractMetaSourceIdFromEvolutionMessage(msg: unknown): string | 
   return findFirstStringByKey(msg, 'sourceId');
 }
 
+/**
+ * WhatsApp Cloud API puts the ad data in `messages[].referral`
+ * (source_id, headline, body, media_type, thumbnail_url, image_url, source_url, ctwa_clid).
+ * Normalised to the same shape Evolution uses for `externalAdReply`.
+ */
+export function extractMetaReferralFromCloudMessage(msg: unknown): Record<string, unknown> | null {
+  const referral = findFirstObjectByKey(msg, 'referral');
+  if (!referral) return null;
+  return {
+    title: referral.headline,
+    body: referral.body,
+    mediaType: referral.media_type,
+    thumbnailUrl: referral.thumbnail_url || referral.image_url,
+    sourceUrl: referral.source_url,
+  };
+}
+
+export function extractMetaCtwaClidFromCloudMessage(msg: unknown): string | null {
+  return findFirstStringByKey(msg, 'ctwa_clid');
+}
+
+export function extractMetaSourceIdFromCloudMessage(msg: unknown): string | null {
+  return findFirstStringByKey(msg, 'source_id');
+}

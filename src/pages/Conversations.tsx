@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import axios from 'axios';
 import { io, Socket } from 'socket.io-client';
+import SaleValueDialog from '../components/SaleValueDialog';
 import { format } from 'date-fns';
 import { ptBR } from 'date-fns/locale';
 import { Search, Filter, MessageSquare, Send, Check, CheckCheck } from 'lucide-react';
@@ -33,6 +34,11 @@ interface Conversation {
   mqlSummary?: string;
   mqlSignals?: string[];
   mqlUpdatedAt?: string;
+  mqlConfirmed?: boolean;
+  saleValue?: number;
+  saleValueSuggested?: number;
+  mqlManipulation?: boolean;
+  mqlCriteria?: Array<{ id: string; label: string; weight: number; met: boolean; evidence: string; rejected?: string }>;
 }
 
 interface Message {
@@ -251,7 +257,8 @@ const Conversations = () => {
     const socketUrl = import.meta.env.DEV
       ? (import.meta.env.VITE_SOCKET_URL || `${window.location.protocol}//${window.location.hostname}:3001`)
       : undefined;
-    const newSocket = socketUrl ? io(socketUrl) : io();
+    const socketOptions = { auth: { token: user.token } };
+    const newSocket = socketUrl ? io(socketUrl, socketOptions) : io(socketOptions);
     setSocket(newSocket);
 
     newSocket.on('connect', () => {
@@ -490,11 +497,29 @@ const Conversations = () => {
     }
   };
 
-  const handleStageChange = async (stage: string) => {
+  const [saleDialog, setSaleDialog] = useState<null | { mode: 'close' | 'edit' }>(null);
+
+  const saveSaleValue = async (value: number) => {
     if (!activeConv) return;
     try {
-      const { data } = await axios.put(`/api/conversations/${activeConv._id}/stage`, 
-        { stage },
+      const { data } = await axios.put(`/api/conversations/${activeConv._id}/sale`, { saleValue: value }, getHeaders());
+      setActiveConv(data);
+      setConversations(prev => prev.map(c => c._id === activeConv._id ? data : c));
+    } catch (error) {
+      console.error('Error saving sale value', error);
+    }
+  };
+
+  const handleStageChange = async (stage: string, saleValue?: number | null) => {
+    if (!activeConv) return;
+    // Closing a sale asks for its value first (Meta uses it to optimise by return)
+    if (stage === 'closed' && activeConv.funnelStage !== 'closed' && saleValue === undefined) {
+      setSaleDialog({ mode: 'close' });
+      return;
+    }
+    try {
+      const { data } = await axios.put(`/api/conversations/${activeConv._id}/stage`,
+        { stage, ...(saleValue ? { saleValue } : {}) },
         getHeaders()
       );
       setActiveConv(data);
@@ -506,9 +531,25 @@ const Conversations = () => {
 
   return (
     <div className="flex h-screen bg-[#fafafa] overflow-hidden">
+      {saleDialog && activeConv && (
+        <SaleValueDialog
+          open
+          editing={saleDialog.mode === 'edit'}
+          leadName={activeConv.contactName || activeConv.contactPhone}
+          suggested={activeConv.saleValueSuggested}
+          current={activeConv.saleValue}
+          onCancel={() => setSaleDialog(null)}
+          onConfirm={(value) => {
+            const mode = saleDialog.mode;
+            setSaleDialog(null);
+            if (mode === 'close') void handleStageChange('closed', value);
+            else if (value) void saveSaleValue(value);
+          }}
+        />
+      )}
       {mqlDetailsOpen && activeConv && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => setMqlDetailsOpen(false)}>
-          <div className="w-full max-w-lg rounded-xl bg-white shadow-lg border border-zinc-200" onClick={(e) => e.stopPropagation()}>
+          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-xl bg-white shadow-lg border border-zinc-200" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center justify-between p-4 border-b border-zinc-200">
               <div className="min-w-0">
                 <h4 className="font-semibold text-zinc-900 truncate">Análise de MQL</h4>
@@ -547,6 +588,46 @@ const Conversations = () => {
                   {activeConv.mqlSummary || 'Sem resumo disponível.'}
                 </p>
               </div>
+              {activeConv.mqlManipulation && (
+                <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                  O lead tentou dar instruções à IA. Essas mensagens foram ignoradas e este lead não é enviado ao Meta automaticamente.
+                </div>
+              )}
+              {activeConv.origin === 'meta_ads' && (
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-zinc-600">Pronto para o Meta</span>
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${activeConv.mqlConfirmed ? 'bg-emerald-50 text-emerald-700' : 'bg-zinc-100 text-zinc-600'}`}>
+                    {activeConv.mqlConfirmed ? 'Confirmado' : 'Não confirmado'}
+                  </span>
+                </div>
+              )}
+              {Array.isArray(activeConv.mqlCriteria) && activeConv.mqlCriteria.length > 0 && (
+                <div>
+                  <p className="text-sm font-medium text-zinc-800 mb-2">Critérios avaliados</p>
+                  <ul className="space-y-2">
+                    {activeConv.mqlCriteria.map((c) => (
+                      <li key={c.id} className="text-sm">
+                        <div className="flex items-start justify-between gap-3">
+                          <span className={c.met ? 'text-zinc-900 font-medium' : 'text-zinc-400'}>
+                            {c.met ? '✓' : '✗'} {c.label}
+                          </span>
+                          <span className={`shrink-0 text-xs font-semibold ${c.met ? (c.weight < 0 ? 'text-red-600' : 'text-emerald-600') : 'text-zinc-300'}`}>
+                            {c.weight > 0 ? '+' : ''}{c.weight}
+                          </span>
+                        </div>
+                        {c.met && c.evidence && (
+                          <p className="text-xs text-zinc-500 italic mt-0.5 pl-4 break-words">“{c.evidence}”</p>
+                        )}
+                        {!c.met && c.rejected && (
+                          <p className="text-xs text-amber-600 mt-0.5 pl-4">
+                            A IA sugeriu, mas a citação foi recusada ({c.rejected === 'wrong_author' ? 'foi escrita pela empresa' : 'não encontrada na conversa'}).
+                          </p>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               <div>
                 <p className="text-sm font-medium text-zinc-800 mb-1">Sinais identificados</p>
                 {Array.isArray(activeConv.mqlSignals) && activeConv.mqlSignals.length > 0 ? (
@@ -768,6 +849,17 @@ const Conversations = () => {
                       <option key={key} value={key}>{label}</option>
                     ))}
                   </select>
+                  {activeConv.funnelStage === 'closed' && (
+                    <button
+                      type="button"
+                      onClick={() => setSaleDialog({ mode: 'edit' })}
+                      className="text-xs font-medium text-primary hover:underline"
+                    >
+                      {typeof activeConv.saleValue === 'number' && activeConv.saleValue > 0
+                        ? activeConv.saleValue.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })
+                        : 'Informar valor da venda'}
+                    </button>
+                  )}
                 </div>
               </div>
             </header>

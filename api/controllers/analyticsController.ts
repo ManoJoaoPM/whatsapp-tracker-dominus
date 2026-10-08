@@ -1,15 +1,22 @@
 import { Response } from 'express';
+import mongoose from 'mongoose';
 import { ClientRequest } from '../middlewares/clientMiddleware.js';
 import Conversation from '../models/Conversation.js';
+import MetaEventLog from '../models/MetaEventLog.js';
 
 export const getAnalytics = async (req: ClientRequest, res: Response): Promise<void> => {
   try {
-    const clientId = req.currentClient.id;
+    // ObjectIds, not strings: Mongoose does not cast the filters of aggregate() pipelines
+    const clientId = req.currentClient._id;
 
     const filter: any = { clientId };
 
     if (typeof req.query.whatsappAccountId === 'string' && req.query.whatsappAccountId) {
-      filter.whatsappAccountId = req.query.whatsappAccountId;
+      if (!mongoose.isValidObjectId(req.query.whatsappAccountId)) {
+        res.status(400).json({ message: 'Invalid whatsappAccountId' });
+        return;
+      }
+      filter.whatsappAccountId = new mongoose.Types.ObjectId(req.query.whatsappAccountId);
     }
 
     const from = typeof req.query.from === 'string' ? req.query.from : '';
@@ -37,7 +44,21 @@ export const getAnalytics = async (req: ClientRequest, res: Response): Promise<v
       };
     }
 
-    const [totalLeads, byOriginAgg, byStageAgg, mqlAgg, topLeads] = await Promise.all([
+    const metaFilter = { ...filter, origin: 'meta_ads' };
+    const present = { $exists: true, $nin: [null, ''] };
+
+    const [
+      totalLeads,
+      byOriginAgg,
+      byStageAgg,
+      mqlAgg,
+      topLeads,
+      metaLeads,
+      metaWithClickId,
+      metaWithCampaign,
+      metaEventsSent,
+      sentByNameAgg,
+    ] = await Promise.all([
       Conversation.countDocuments(filter),
       Conversation.aggregate([
         { $match: filter },
@@ -71,8 +92,27 @@ export const getAnalytics = async (req: ClientRequest, res: Response): Promise<v
             lastMessageAt: 1
           }
         }
-      ])
+      ]),
+      Conversation.countDocuments(metaFilter),
+      Conversation.countDocuments({ ...metaFilter, metaCtwaClid: present }),
+      Conversation.countDocuments({ ...metaFilter, 'metaAdData.campaignId': present }),
+      Conversation.countDocuments({ ...metaFilter, 'metaConversions.mqlQualifiedSentAt': { $exists: true } }),
+      MetaEventLog.aggregate([
+        {
+          $match: {
+            clientId,
+            status: 'sent',
+            ...(filter.lastMessageAt ? { sentAt: filter.lastMessageAt } : {}),
+          },
+        },
+        { $group: { _id: '$eventName', count: { $sum: 1 } } },
+      ]),
     ]);
+
+    const eventsByName: Record<string, number> = { LeadSubmitted: 0, QualifiedLead: 0, Purchase: 0 };
+    for (const row of sentByNameAgg) {
+      if (row?._id && typeof row.count === 'number') eventsByName[String(row._id)] = row.count;
+    }
 
     const byOrigin = {
       meta_ads: 0,
@@ -115,6 +155,16 @@ export const getAnalytics = async (req: ClientRequest, res: Response): Promise<v
       mql: {
         avgScore,
         scoredLeads: mqlAgg?.[0]?.scoredLeads ?? 0
+      },
+      // How much of the Meta traffic can actually be attributed to an ad click
+      attribution: {
+        metaLeads,
+        withClickId: metaWithClickId,
+        withCampaign: metaWithCampaign,
+        eventsSent: metaEventsSent,
+        eventsByName,
+        clickCaptureRate: metaLeads > 0 ? Math.round((metaWithClickId / metaLeads) * 1000) / 10 : null,
+        campaignResolveRate: metaWithClickId > 0 ? Math.round((metaWithCampaign / metaWithClickId) * 1000) / 10 : null,
       },
       topLeads
     });

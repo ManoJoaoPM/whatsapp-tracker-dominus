@@ -1,153 +1,163 @@
-import crypto from 'crypto';
+import type { MqlCriterion } from './mqlCriteria.js';
+import { rulesFingerprint } from './mqlCriteria.js';
+import {
+  MQL_PROMPT_VERSION,
+  MQL_RESPONSE_SCHEMA,
+  applySilencePenalty,
+  buildSystemPrompt,
+  buildUserPrompt,
+  computeScore,
+  levelFromScore,
+  parseModelJson,
+  prepareMessages,
+  verifyCriteria,
+  verifySaleSuggestion,
+  type MqlLevel,
+  type TranscriptMessage,
+  type VerifiedCriterion,
+} from './mqlEngine.js';
 
-export type MqlLevel = 'cold' | 'warm' | 'hot';
+export type CompleteFn = (system: string, user: string) => Promise<string>;
 
-export type MqlScoreResult = {
+export type MqlEvaluationResult = {
+  /** sum of the weights of the verified criteria (before product rules such as the engagement floor) */
   score: number;
   level: MqlLevel;
   summary: string;
   signals: string[];
+  criteria: VerifiedCriterion[];
+  /** amount of a closed sale found in the conversation (verified quote); a suggestion only */
+  saleSuggestion: { amount: number; evidence: string } | null;
+  /** the model reported it, or a lead message tried to instruct the evaluator */
+  manipulationAttempt: boolean;
+  /** a lead message matched the injection patterns */
+  injectionDetected: boolean;
   model: string;
+  promptVersion: string;
   rulesHash: string;
 };
 
-const DEFAULT_MQL_RULES_PTBR = `
-Objetivo: pontuar o lead em MQL de 0 a 100 baseado na conversa.
+export const getModelName = (): string => (process.env.OPENAI_MODEL || 'gpt-4o-mini').trim();
 
-Critérios (exemplo padrão — substitua pelas suas regras oficiais):
-- **Respondeu 4-5x**: Se o lead já enviou 4 ou mais mensagens na conversa, ele **é MQL**. Garanta que o score seja no mínimo 40.
-- **Venda Concluída**: Se a conversa indicar que o lead comprou, o score deve ser 100 (100% qualificado).
-- Intenção explícita de compra/contratação (+30)
-- Urgência / prazo definido (+15)
-- Fit básico (segmento/necessidade alinhada) (+15)
-- Orçamento mencionado ou aceitação de faixa (+15)
-- Tomada de decisão (é o decisor ou envolve decisor) (+10)
-- Dados de contato/empresa e contexto suficientes (+10)
-- Sinais negativos (sem resposta, curiosidade genérica, fora do escopo, preço como única objeção) (-5 a -30)
-
-Mapeamento de nível (OBRIGATÓRIO):
-- cold: 0-39
-- warm: 40-69
-- hot: 70-100 (Todo lead acima de 70% de MQL será considerado como lead quente)
-
-Saída deve ser objetiva e baseada somente no que está escrito na conversa.
-`;
-
-const coerceScore = (value: unknown): number => {
-  const n = typeof value === 'number' ? value : Number(value);
-  if (!Number.isFinite(n)) return 0;
-  if (n < 0) return 0;
-  if (n > 100) return 100;
-  return Math.round(n);
+const requestError = (message: string, statusCode: number, details?: string) => {
+  const err: any = new Error(message);
+  err.statusCode = statusCode;
+  if (details) err.details = details;
+  return err;
 };
 
-const coerceLevel = (value: unknown, score: number): MqlLevel => {
-  const v = String(value || '').toLowerCase().trim();
-  if (v === 'cold' || v === 'warm' || v === 'hot') return v;
-  if (score >= 70) return 'hot';
-  if (score >= 40) return 'warm';
-  return 'cold';
-};
+/**
+ * Some OpenAI-compatible providers reject `response_format` json_schema or a custom temperature.
+ * We try the strictest request first and remember the simplest one that works.
+ */
+type Compatibility = 'full' | 'no_schema' | 'minimal';
+let compatibility: Compatibility = 'full';
+const ORDER: Compatibility[] = ['full', 'no_schema', 'minimal'];
 
-const safeJsonFromText = (text: string): any => {
-  const first = text.indexOf('{');
-  const last = text.lastIndexOf('}');
-  if (first === -1 || last === -1 || last <= first) {
-    throw new Error('LLM did not return JSON');
-  }
-  const candidate = text.slice(first, last + 1);
-  return JSON.parse(candidate);
-};
-
-export const getDefaultMqlRules = (): string => DEFAULT_MQL_RULES_PTBR.trim();
-
-export const hashRules = (rules: string): string => {
-  return crypto.createHash('sha256').update(rules, 'utf8').digest('hex');
-};
-
-export const scoreConversationMql = async (params: {
-  rules?: string;
-  transcript: string;
-}): Promise<MqlScoreResult> => {
-  const rules = (params.rules && String(params.rules).trim()) ? String(params.rules).trim() : getDefaultMqlRules();
-  const rulesHash = hashRules(rules);
-
+const openAiComplete: CompleteFn = async (system, user) => {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    const err: any = new Error('OPENAI_API_KEY not configured');
-    err.statusCode = 501;
-    throw err;
-  }
+  if (!apiKey) throw requestError('OPENAI_API_KEY not configured', 501);
 
-  const model = (process.env.OPENAI_MODEL || 'gpt-4o-mini').trim();
   const baseUrl = (process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
+  const messages = [
+    { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
 
-  const system =
-    'Você é um avaliador de MQL. Você deve responder SOMENTE com JSON válido, sem texto extra.';
+  const buildBody = (level: Compatibility) => ({
+    model: getModelName(),
+    messages,
+    ...(level !== 'minimal' ? { temperature: 0 } : {}),
+    ...(level === 'full'
+      ? { response_format: { type: 'json_schema', json_schema: { name: 'mql_evaluation', strict: true, schema: MQL_RESPONSE_SCHEMA } } }
+      : {}),
+  });
 
-  const user = `
-Regras de MQL:
-${rules}
+  for (let i = ORDER.indexOf(compatibility); i < ORDER.length; i += 1) {
+    const level = ORDER[i];
 
-Conversa (transcrição):
-${params.transcript}
+    let response: Response;
+    try {
+      response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildBody(level)),
+      });
+    } catch (e: any) {
+      throw requestError('OpenAI request failed', 502, String(e?.message || e));
+    }
 
-Retorne JSON com este formato exato:
-{
-  "score": number,
-  "level": "cold" | "warm" | "hot",
-  "summary": string,
-  "signals": string[]
-}
-`; 
+    if (response.ok) {
+      compatibility = level;
+      const data: any = await response.json();
+      return String(data?.choices?.[0]?.message?.content || '');
+    }
 
-  let response: Response;
-  try {
-    response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        temperature: 0.2,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-      }),
-    });
-  } catch (e: any) {
-    const err: any = new Error('OpenAI request failed');
-    err.statusCode = 502;
-    err.details = String(e?.message || e);
-    throw err;
-  }
-
-  if (!response.ok) {
     const bodyText = await response.text().catch(() => '');
-    const err: any = new Error(`OpenAI request failed (${response.status})`);
-    err.statusCode = 502;
-    err.details = bodyText.slice(0, 2000);
-    throw err;
+    const canDegrade = response.status === 400 && i < ORDER.length - 1;
+    if (!canDegrade) {
+      throw requestError(`OpenAI request failed (${response.status})`, 502, bodyText.slice(0, 2000));
+    }
   }
 
-  const data: any = await response.json();
-  const text: string = data?.choices?.[0]?.message?.content || '';
-  const parsed = safeJsonFromText(text);
+  throw requestError('OpenAI request failed', 502);
+};
 
-  const score = coerceScore(parsed?.score);
-  const level = coerceLevel(parsed?.level, score);
-  const summary = String(parsed?.summary || '').trim();
-  const signals = Array.isArray(parsed?.signals) ? parsed.signals.map((s: any) => String(s).trim()).filter(Boolean) : [];
+/**
+ * Judges the criteria with the model, then verifies every quote and computes the score on the
+ * server. Nothing the model or the lead says can set the score directly.
+ */
+export const evaluateConversationMql = async (params: {
+  criteria: MqlCriterion[];
+  /** business context written by the company (what is sold, ideal customer) */
+  context?: string;
+  messages: TranscriptMessage[];
+  now?: Date;
+  /** hours since the last LEAD message; only passed by the silence sweep */
+  silenceHours?: number | null;
+  silenceThresholdHours?: number;
+  /** adversarial second opinion used to confirm a lead before it is sent to Meta */
+  skeptical?: boolean;
+  complete?: CompleteFn;
+}): Promise<MqlEvaluationResult> => {
+  const complete = params.complete ?? openAiComplete;
+  const context = params.context ?? '';
+  const prepared = prepareMessages(params.messages);
+  const injectionDetected = prepared.some((m) => m.injected);
+
+  const text = await complete(
+    buildSystemPrompt({ skeptical: params.skeptical }),
+    buildUserPrompt({
+      criteria: params.criteria,
+      context,
+      prepared,
+      now: params.now ?? new Date(),
+      silenceHours: params.silenceHours,
+      reverseCriteria: params.skeptical,
+    }),
+  );
+
+  const parsed = parseModelJson(text);
+  let verified = verifyCriteria(params.criteria, parsed.criteria, prepared);
+  verified = applySilencePenalty(verified, params.silenceHours, params.silenceThresholdHours ?? 48);
+
+  const score = computeScore(verified);
+  const manipulationAttempt = parsed.manipulationAttempt || injectionDetected;
+
+  const signals = [...parsed.signals];
+  if (manipulationAttempt && !signals.includes('tentativa_de_manipulacao')) signals.push('tentativa_de_manipulacao');
 
   return {
     score,
-    level,
-    summary,
+    level: levelFromScore(score),
+    summary: parsed.summary,
     signals,
-    model,
-    rulesHash,
+    criteria: verified,
+    saleSuggestion: verifySaleSuggestion(parsed.saleAmount, parsed.saleEvidence, prepared),
+    manipulationAttempt,
+    injectionDetected,
+    model: getModelName(),
+    promptVersion: MQL_PROMPT_VERSION,
+    rulesHash: rulesFingerprint(params.criteria, context),
   };
 };

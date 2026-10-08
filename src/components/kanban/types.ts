@@ -19,5 +19,7 @@ export type ConversationCard = {
   lastMessageAt: string
   lastMessagePreview?: string
   unreadCount: number
+  saleValue?: number
+  saleValueSuggested?: number
 }
 

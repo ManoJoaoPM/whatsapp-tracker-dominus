@@ -16,9 +16,11 @@ function originBadgeClass(origin: ConversationCard['origin']) {
 export function LeadCard({
   card,
   onOpenConversation,
+  onEditSaleValue,
 }: {
   card: ConversationCard
   onOpenConversation: (conversationId: string) => void
+  onEditSaleValue?: (card: ConversationCard) => void
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: card.id,
@@ -62,6 +64,32 @@ export function LeadCard({
 
       {card.lastMessagePreview && (
         <div className="mt-2 truncate text-xs text-zinc-600">{card.lastMessagePreview}</div>
+      )}
+
+      {card.funnelStage === 'closed' && (
+        <div className="mt-2 flex items-center justify-between gap-2">
+          {typeof card.saleValue === 'number' && card.saleValue > 0 ? (
+            <span className="text-xs font-semibold text-emerald-700">
+              {card.saleValue.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+            </span>
+          ) : (
+            <span className="text-[11px] text-amber-700">Sem valor da venda</span>
+          )}
+          {onEditSaleValue && (
+            <button
+              type="button"
+              // keeps the card from starting a drag or opening the conversation
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation()
+                onEditSaleValue(card)
+              }}
+              className="text-[11px] font-medium text-primary hover:underline"
+            >
+              {card.saleValue ? 'Editar' : 'Informar valor'}
+            </button>
+          )}
+        </div>
       )}
 
       {card.unreadCount > 0 && (

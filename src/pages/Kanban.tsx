@@ -9,6 +9,7 @@ import { FUNNEL_STAGES } from '@/components/kanban/constants'
 import type { ConversationCard, FunnelStage, LeadOrigin } from '@/components/kanban/types'
 import { KanbanToolbar } from '@/components/kanban/KanbanToolbar'
 import { KanbanStageSlider } from '@/components/kanban/KanbanStageSlider'
+import SaleValueDialog from '@/components/SaleValueDialog'
 
 type KanbanResponse = {
   stages: FunnelStage[]
@@ -68,6 +69,10 @@ export default function Kanban() {
   const [error, setError] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
   const [isDndDragging, setIsDndDragging] = useState(false)
+  // a card dropped on "closed" waits here until the sale value is informed
+  const [pendingClose, setPendingClose] = useState<{ id: string; fromStage: FunnelStage } | null>(null)
+  // a card already closed whose value is being set or corrected
+  const [editingSale, setEditingSale] = useState<ConversationCard | null>(null)
 
   const toastTimerRef = useRef<number | null>(null)
   const socketRef = useRef<Socket | null>(null)
@@ -149,7 +154,8 @@ export default function Kanban() {
     const socketUrl = import.meta.env.DEV
       ? (import.meta.env.VITE_SOCKET_URL || `${window.location.protocol}//${window.location.hostname}:3001`)
       : undefined
-    const s = socketUrl ? io(socketUrl) : io()
+    const socketOptions = { auth: { token: user.token } }
+    const s = socketUrl ? io(socketUrl, socketOptions) : io(socketOptions)
     socketRef.current = s
 
     s.on('connect', () => {
@@ -170,6 +176,8 @@ export default function Kanban() {
         lastMessageAt: new Date(conv.lastMessageAt).toISOString(),
         lastMessagePreview: conv.lastMessageContent || undefined,
         unreadCount: conv.unreadCount || 0,
+        saleValue: conv.saleValue,
+        saleValueSuggested: conv.saleValueSuggested,
       }
 
       setColumns((prev) => {
@@ -220,22 +228,16 @@ export default function Kanban() {
     }
   }, [user, selectedClientId])
 
-  const onDragEnd = useCallback(
-    async (evt: any) => {
-      setIsDndDragging(false)
-      lastDragEndAtRef.current = Date.now()
-      const activeId = evt?.active?.id ? String(evt.active.id) : ''
-      const overId = evt?.over?.id ? String(evt.over.id) : ''
-      if (!activeId || !overId) return
-
-      const fromStage = findStageOf(columns, activeId)
-      const toStage = FUNNEL_STAGES.includes(overId as FunnelStage) ? (overId as FunnelStage) : null
-      if (!fromStage || !toStage || fromStage === toStage) return
-
+  const commitMove = useCallback(
+    async (activeId: string, fromStage: FunnelStage, toStage: FunnelStage, saleValue?: number | null) => {
       const moving = columns[fromStage].find((c) => c.id === activeId)
       if (!moving) return
 
-      const nextCard: ConversationCard = { ...moving, funnelStage: toStage }
+      const nextCard: ConversationCard = {
+        ...moving,
+        funnelStage: toStage,
+        ...(toStage === 'closed' && saleValue ? { saleValue } : {}),
+      }
 
       setColumns((prev) => {
         const copy = { ...prev }
@@ -255,7 +257,7 @@ export default function Kanban() {
       try {
         await axios.patch(
           `/api/conversations/${activeId}/stage`,
-          { stage: toStage },
+          { stage: toStage, ...(saleValue ? { saleValue } : {}) },
           {
             headers,
           }
@@ -276,6 +278,45 @@ export default function Kanban() {
       }
     },
     [columns, headers, showToast]
+  )
+
+  const onDragEnd = useCallback(
+    async (evt: any) => {
+      setIsDndDragging(false)
+      lastDragEndAtRef.current = Date.now()
+      const activeId = evt?.active?.id ? String(evt.active.id) : ''
+      const overId = evt?.over?.id ? String(evt.over.id) : ''
+      if (!activeId || !overId) return
+
+      const fromStage = findStageOf(columns, activeId)
+      const toStage = FUNNEL_STAGES.includes(overId as FunnelStage) ? (overId as FunnelStage) : null
+      if (!fromStage || !toStage || fromStage === toStage) return
+
+      // Closing a sale asks for its value first: it is what lets Meta optimise by return
+      if (toStage === 'closed') {
+        setPendingClose({ id: activeId, fromStage })
+        return
+      }
+
+      await commitMove(activeId, fromStage, toStage)
+    },
+    [columns, commitMove]
+  )
+
+  const saveSaleValue = useCallback(
+    async (card: ConversationCard, value: number) => {
+      try {
+        await axios.put(`/api/conversations/${card.id}/sale`, { saleValue: value }, { headers })
+        setColumns((prev) => ({
+          ...prev,
+          [card.funnelStage]: prev[card.funnelStage].map((c) => (c.id === card.id ? { ...c, saleValue: value } : c)),
+        }))
+        showToast('Valor salvo')
+      } catch (_e) {
+        showToast('Não foi possível salvar o valor')
+      }
+    },
+    [headers, showToast]
   )
 
   const onDragStart = useCallback(() => {
@@ -328,11 +369,45 @@ export default function Kanban() {
                 cards={columns[stage] || []}
                 isLoading={loading}
                 onOpenConversation={openConversation}
+                onEditSaleValue={setEditingSale}
               />
             ))}
           </div>
         </DndContext>
       </div>
+
+      {pendingClose && (() => {
+        const card = columns[pendingClose.fromStage].find((c) => c.id === pendingClose.id)
+        return (
+          <SaleValueDialog
+            open
+            leadName={card?.contactName?.trim() || card?.contactPhone || ''}
+            suggested={card?.saleValueSuggested}
+            onCancel={() => setPendingClose(null)}
+            onConfirm={(value) => {
+              const { id, fromStage } = pendingClose
+              setPendingClose(null)
+              void commitMove(id, fromStage, 'closed', value)
+            }}
+          />
+        )
+      })()}
+
+      {editingSale && (
+        <SaleValueDialog
+          open
+          editing
+          leadName={editingSale.contactName?.trim() || editingSale.contactPhone}
+          suggested={editingSale.saleValueSuggested}
+          current={editingSale.saleValue}
+          onCancel={() => setEditingSale(null)}
+          onConfirm={(value) => {
+            const card = editingSale
+            setEditingSale(null)
+            if (value) void saveSaleValue(card, value)
+          }}
+        />
+      )}
 
       {toast && (
         <div className="fixed bottom-6 right-6 z-50 rounded-lg border border-zinc-200 bg-white px-4 py-2 text-sm font-medium text-zinc-800 shadow-lg">

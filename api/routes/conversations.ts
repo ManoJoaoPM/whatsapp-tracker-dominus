@@ -6,6 +6,7 @@ import {
   getMessages,
   sendMessage,
   updateFunnelStage,
+  updateSaleValue,
 } from '../controllers/conversationController.js';
 import { protect } from '../middlewares/authMiddleware.js';
 import { requireClient } from '../middlewares/clientMiddleware.js';
@@ -19,5 +20,7 @@ router.get('/:id/messages', protect, requireClient, getMessages);
 router.post('/:id/messages', protect, requireClient, sendMessage);
 router.put('/:id/stage', protect, requireClient, updateFunnelStage);
 router.patch('/:id/stage', protect, requireClient, updateFunnelStage);
+router.put('/:id/sale', protect, requireClient, updateSaleValue);
+router.patch('/:id/sale', protect, requireClient, updateSaleValue);
 
 export default router;

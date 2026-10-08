@@ -1,21 +1,64 @@
 import axios from 'axios';
 import crypto from 'crypto';
-import Conversation from '../models/Conversation.js';
-import type { IConversation } from '../models/Conversation.js';
 import Client from '../models/Client.js';
 import { decryptFromStorage } from './secretVault.js';
+import { readEventsReceived, validateMetaEvent, wasEventAccepted } from './metaEventValidation.js';
 
-const META_API_VERSION = 'v20.0';
+export const META_API_VERSION = 'v20.0';
 
-const getClientMetaConfig = async (clientId: string): Promise<{ pixelId: string; pageId?: string; accessToken: string; triggerLevel: 'cold' | 'warm' | 'hot' } | null> => {
+export type MetaEventsConfig = {
+  leadSubmitted: { enabled: boolean; minInbound: number };
+  qualifiedLead: { enabled: boolean };
+  purchase: { enabled: boolean };
+};
+
+export type MetaConfig = {
+  pixelId: string;
+  pageId?: string;
+  accessToken: string;
+  triggerLevel: 'cold' | 'warm' | 'hot';
+  sendUntracked: boolean;
+  /** ISO 4217 currency of Purchase events */
+  currency: string;
+  events: MetaEventsConfig;
+};
+
+/** Defaults keep the behaviour of clients created before the event ladder existed */
+export const resolveMetaEventsConfig = (raw: any): MetaEventsConfig => {
+  const minInbound = Number(raw?.leadSubmitted?.minInbound);
+  return {
+    leadSubmitted: {
+      enabled: raw?.leadSubmitted?.enabled === true,
+      minInbound: Number.isInteger(minInbound) && minInbound >= 1 && minInbound <= 20 ? minInbound : 2,
+    },
+    qualifiedLead: { enabled: raw?.qualifiedLead?.enabled !== false },
+    purchase: { enabled: raw?.purchase?.enabled === true },
+  };
+};
+
+export const resolveCurrency = (raw: unknown): string => {
+  const code = String(raw || '').trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(code) ? code : 'BRL';
+};
+
+export const getClientMetaConfig = async (clientId: string): Promise<MetaConfig | null> => {
   const client = await Client.findById(clientId).select('+metaAds.capiAccessTokenEnc');
   const pixelId = String(client?.metaAds?.pixelId || '').trim();
   const pageId = String(client?.metaAds?.pageId || '').trim();
   const enc = String(client?.metaAds?.capiAccessTokenEnc || '').trim();
   const triggerLevel = (client?.metaAds?.mqlTriggerLevel || 'hot') as 'cold' | 'warm' | 'hot';
+  const sendUntracked = Boolean(client?.metaAds?.sendUntracked);
   if (enc) {
     const accessToken = decryptFromStorage(enc);
-    return { pixelId, pageId: pageId || undefined, accessToken, triggerLevel };
+    return {
+      pixelId,
+      pageId: pageId || undefined,
+      accessToken,
+      triggerLevel,
+      sendUntracked,
+      currency: resolveCurrency(client?.metaAds?.currency),
+      events: resolveMetaEventsConfig(client?.metaAds?.events),
+    };
   }
   return null;
 };
@@ -103,148 +146,16 @@ export const fetchMetaAdDetails = async (params: {
   }
 };
 
-const sha256 = (value: string): string => {
+export const sha256 = (value: string): string => {
   return crypto.createHash('sha256').update(value).digest('hex');
 };
 
-const normalizePhone = (phone: string): string => {
+export const normalizePhone = (phone: string): string => {
   return String(phone || '').replace(/\D+/g, '');
-};
-
-const buildEventId = (conversationId: string): string => {
-  return `mql_${String(conversationId)}`;
 };
 
 const buildTestEventId = (): string => {
   return `test_${crypto.randomBytes(8).toString('hex')}`;
-};
-
-export const shouldTriggerMetaMqlConversion = (params: {
-  previousLevel?: IConversation['mqlLevel'];
-  nextLevel?: IConversation['mqlLevel'];
-  triggerLevel: 'cold' | 'warm' | 'hot';
-}): boolean => {
-  const trigger = params.triggerLevel;
-  if (!params.nextLevel) return false;
-  if (params.nextLevel !== trigger) return false;
-  return params.previousLevel !== trigger;
-};
-
-export const trySendMetaMqlQualifiedConversion = async (params: {
-  conversationId: string;
-  clientId: string;
-  previousLevel?: IConversation['mqlLevel'];
-  nextLevel?: IConversation['mqlLevel'];
-}): Promise<{ sent: boolean; skipped: boolean; reason?: string } > => {
-  const metaConfig = await getClientMetaConfig(params.clientId).catch(() => null);
-  if (!metaConfig) return { sent: false, skipped: true, reason: 'not_configured' };
-
-  if (!shouldTriggerMetaMqlConversion({ previousLevel: params.previousLevel, nextLevel: params.nextLevel, triggerLevel: metaConfig.triggerLevel })) {
-    return { sent: false, skipped: true, reason: 'not_triggered' };
-  }
-
-  const triggerLevel = metaConfig.triggerLevel;
-  const eventId = buildEventId(params.conversationId);
-
-  const claimed = await Conversation.findOneAndUpdate(
-    {
-      _id: params.conversationId,
-      clientId: params.clientId,
-      origin: 'meta_ads',
-      mqlLevel: triggerLevel,
-      'metaConversions.mqlQualifiedSentAt': { $exists: false },
-      $or: [
-        { 'metaConversions.mqlQualifiedSending': { $exists: false } },
-        { 'metaConversions.mqlQualifiedSending': { $ne: true } },
-      ],
-    },
-    {
-      $set: {
-        'metaConversions.mqlQualifiedSending': true,
-        'metaConversions.mqlQualifiedAttemptedAt': new Date(),
-        'metaConversions.mqlQualifiedEventId': eventId,
-      },
-      $unset: {
-        'metaConversions.mqlQualifiedLastError': 1,
-        'metaConversions.mqlQualifiedLastStatus': 1,
-      },
-    },
-    { new: true },
-  );
-
-  if (!claimed) return { sent: false, skipped: true, reason: 'not_eligible_or_already_sent' };
-
-  const pixelId = metaConfig.pixelId;
-  const pageId = metaConfig.pageId;
-  const accessToken = metaConfig.accessToken;
-  const apiVersion = META_API_VERSION;
-
-  const ph = normalizePhone(claimed.contactPhone);
-  const phHash = ph ? sha256(ph) : undefined;
-  const externalId = ph ? sha256(`${params.clientId}:${ph}`) : sha256(`${params.clientId}:${String(params.conversationId)}`);
-
-  const eventTime = Math.floor(Date.now() / 1000);
-  const actionSource = claimed.metaCtwaClid ? 'business_messaging' : 'chat';
-  
-  const body: any = {
-    data: [
-      {
-        event_name: actionSource === 'business_messaging' ? 'qualified_lead' : 'QualifiedLead',
-        event_time: eventTime,
-        action_source: actionSource,
-        ...(actionSource === 'business_messaging' ? { messaging_channel: 'whatsapp' } : {}),
-        event_id: eventId,
-        user_data: {
-          external_id: [externalId],
-          ...(phHash ? { ph: [phHash] } : {}),
-          ...(actionSource === 'business_messaging' && claimed.metaCtwaClid ? { ctwa_clid: claimed.metaCtwaClid } : {}),
-          ...(pageId ? { page_id: pageId } : {}),
-        },
-        custom_data: {
-          conversation_id: String(params.conversationId),
-          mql_level: String(claimed.mqlLevel || ''),
-          mql_score: typeof claimed.mqlScore === 'number' ? claimed.mqlScore : undefined,
-          ...(actionSource !== 'business_messaging' && claimed.metaCtwaClid ? { ctwa_clid: claimed.metaCtwaClid } : {}),
-        },
-      },
-    ],
-  };
-  try {
-    const url = `https://graph.facebook.com/${apiVersion}/${encodeURIComponent(pixelId)}/events`;
-    const response = await axios.post(url, body, {
-      params: { access_token: accessToken },
-      timeout: 15_000,
-    });
-
-    await Conversation.updateOne(
-      { _id: claimed._id },
-      {
-        $set: {
-          'metaConversions.mqlQualifiedSending': false,
-          'metaConversions.mqlQualifiedSentAt': new Date(),
-          'metaConversions.mqlQualifiedLastStatus': Number(response.status),
-        },
-      },
-    );
-
-    return { sent: true, skipped: false };
-  } catch (error: any) {
-    const status = Number(error?.response?.status);
-    const message = String(error?.response?.data?.error?.message || error?.message || 'Meta CAPI error');
-
-    await Conversation.updateOne(
-      { _id: claimed._id },
-      {
-        $set: {
-          'metaConversions.mqlQualifiedSending': false,
-          'metaConversions.mqlQualifiedLastError': message.slice(0, 500),
-          'metaConversions.mqlQualifiedLastStatus': Number.isFinite(status) ? status : undefined,
-        },
-      },
-    );
-
-    return { sent: false, skipped: false, reason: 'send_failed' };
-  }
 };
 
 export const sendMetaTestEvent = async (params: {
@@ -315,12 +226,31 @@ export const sendMetaTestEvent = async (params: {
 
   if (!body.test_event_code) return { ok: false, error: 'test_event_code_required' };
 
+  const issues = validateMetaEvent(body.data[0]);
+  if (issues.length > 0) {
+    return {
+      ok: false,
+      error: `invalid_event: ${issues.join('; ')}`,
+      debug: { pixelId, requestBody: body, issues },
+    };
+  }
+
   try {
     const url = `https://graph.facebook.com/${apiVersion}/${encodeURIComponent(pixelId)}/events`;
     const response = await axios.post(url, body, {
       params: { access_token: accessToken },
       timeout: 15_000,
     });
+
+    if (!wasEventAccepted(response.data)) {
+      return {
+        ok: false,
+        status: Number(response.status),
+        error: `Meta answered ${response.status} but events_received=${readEventsReceived(response.data) ?? 'missing'}. The event was not accepted.`,
+        debug: { pixelId, url, requestBody: body, responseBody: response.data },
+      };
+    }
+
     return {
       ok: true,
       status: Number(response.status),

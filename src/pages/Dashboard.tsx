@@ -24,6 +24,15 @@ interface AnalyticsData {
     avgScore: number | null;
     scoredLeads: number;
   };
+  attribution?: {
+    metaLeads: number;
+    withClickId: number;
+    withCampaign: number;
+    eventsSent: number;
+    eventsByName?: { LeadSubmitted: number; QualifiedLead: number; Purchase: number };
+    clickCaptureRate: number | null;
+    campaignResolveRate: number | null;
+  };
   topLeads: Array<{
     _id: string;
     contactName?: string;
@@ -161,6 +170,62 @@ const Dashboard = () => {
               </p>
             </div>
           </div>
+
+          {data.attribution && (
+            <div className="rounded-xl bg-white p-6 shadow-sm border border-zinc-100">
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="text-lg font-semibold text-zinc-800">Qualidade da atribuição (Meta Ads)</h3>
+                <span
+                  className={`text-xs font-semibold px-2 py-1 rounded-full ${
+                    data.attribution.clickCaptureRate === null
+                      ? 'bg-zinc-100 text-zinc-500'
+                      : data.attribution.clickCaptureRate >= 80
+                        ? 'bg-emerald-50 text-emerald-700'
+                        : data.attribution.clickCaptureRate >= 50
+                          ? 'bg-amber-50 text-amber-700'
+                          : 'bg-red-50 text-red-700'
+                  }`}
+                >
+                  {data.attribution.clickCaptureRate === null ? 'Sem leads Meta' : `${data.attribution.clickCaptureRate}% com clique rastreado`}
+                </span>
+              </div>
+              <p className="text-xs text-zinc-500 mb-5">
+                Só leads com <code>ctwa_clid</code> podem ser ligados ao anúncio pelo Meta. Compare "Leads Meta" com as conversas iniciadas no Gerenciador de Anúncios: se forem muito diferentes, há cliques sem captura.
+              </p>
+              <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+                <div className="p-3 bg-zinc-50 rounded-lg">
+                  <div className="text-xs text-zinc-500">Leads Meta</div>
+                  <div className="text-2xl font-bold text-zinc-800">{data.attribution.metaLeads}</div>
+                </div>
+                <div className="p-3 bg-zinc-50 rounded-lg">
+                  <div className="text-xs text-zinc-500">Com ctwa_clid</div>
+                  <div className="text-2xl font-bold text-zinc-800">{data.attribution.withClickId}</div>
+                </div>
+                <div className="p-3 bg-zinc-50 rounded-lg">
+                  <div className="text-xs text-zinc-500">Campanha identificada</div>
+                  <div className="text-2xl font-bold text-zinc-800">
+                    {data.attribution.withCampaign}
+                    {data.attribution.campaignResolveRate !== null && (
+                      <span className="text-sm font-medium text-zinc-500 ml-1">({data.attribution.campaignResolveRate}%)</span>
+                    )}
+                  </div>
+                </div>
+                <div className="p-3 bg-zinc-50 rounded-lg">
+                  <div className="text-xs text-zinc-500">Eventos enviados ao Meta</div>
+                  <div className="text-2xl font-bold text-zinc-800">
+                    {data.attribution.eventsByName
+                      ? data.attribution.eventsByName.LeadSubmitted + data.attribution.eventsByName.QualifiedLead + data.attribution.eventsByName.Purchase
+                      : data.attribution.eventsSent}
+                  </div>
+                  {data.attribution.eventsByName && (
+                    <div className="mt-1 text-[11px] text-zinc-500 leading-tight">
+                      Lead {data.attribution.eventsByName.LeadSubmitted} · Qualificado {data.attribution.eventsByName.QualifiedLead} · Compra {data.attribution.eventsByName.Purchase}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 gap-6 md:grid-cols-2">
             {/* Por Origem */}

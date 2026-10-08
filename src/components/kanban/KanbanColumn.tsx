@@ -10,12 +10,14 @@ export function KanbanColumn({
   cards,
   isLoading,
   onOpenConversation,
+  onEditSaleValue,
 }: {
   stage: FunnelStage
   count: number
   cards: ConversationCard[]
   isLoading: boolean
   onOpenConversation: (conversationId: string) => void
+  onEditSaleValue?: (card: ConversationCard) => void
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: stage })
 
@@ -56,7 +58,9 @@ export function KanbanColumn({
             <div className="mt-1 text-[11px] text-zinc-500">Arraste um card aqui para atualizar.</div>
           </div>
         ) : (
-          cards.map((card) => <LeadCard key={card.id} card={card} onOpenConversation={onOpenConversation} />)
+          cards.map((card) => (
+            <LeadCard key={card.id} card={card} onOpenConversation={onOpenConversation} onEditSaleValue={onEditSaleValue} />
+          ))
         )}
       </div>
     </section>

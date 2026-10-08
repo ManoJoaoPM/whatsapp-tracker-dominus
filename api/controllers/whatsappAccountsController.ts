@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import { ClientRequest } from '../middlewares/clientMiddleware.js';
 import WhatsAppAccount from '../models/WhatsAppAccount.js';
 import {
+  buildEvolutionWebhookUrl,
   connectInstance,
   createInstance,
   getConnectionState,
@@ -43,12 +44,44 @@ export const createWhatsAppAccount = async (req: ClientRequest, res: Response): 
   try {
     const client = req.currentClient;
     const displayName = typeof req.body?.displayName === 'string' ? req.body.displayName.trim() : '';
+    const provider = typeof req.body?.provider === 'string' ? req.body.provider.trim() : '';
+
+    if (provider === 'cloud') {
+      const cloudPhoneNumberId =
+        typeof req.body?.cloudPhoneNumberId === 'string' ? req.body.cloudPhoneNumberId.trim() : '';
+      const cloudWabaId = typeof req.body?.cloudWabaId === 'string' ? req.body.cloudWabaId.trim() : '';
+      const cloudDisplayPhoneNumber =
+        typeof req.body?.cloudDisplayPhoneNumber === 'string' ? req.body.cloudDisplayPhoneNumber.trim() : '';
+
+      if (!cloudPhoneNumberId) {
+        res.status(400).json({ message: 'cloudPhoneNumberId is required' });
+        return;
+      }
+
+      const account = await WhatsAppAccount.create({
+        clientId: client.id,
+        provider: 'cloud',
+        displayName: displayName || undefined,
+        cloudPhoneNumberId,
+        cloudWabaId: cloudWabaId || undefined,
+        cloudDisplayPhoneNumber: cloudDisplayPhoneNumber || undefined,
+        status: 'connected',
+        connectedAt: new Date(),
+      });
+
+      res.json({
+        account,
+        qrCode: null,
+      });
+      return;
+    }
 
     const suffix = new mongoose.Types.ObjectId().toHexString();
     const instanceName = `client_${String(client.id)}_wa_${suffix}`;
 
     const account = await WhatsAppAccount.create({
       clientId: client.id,
+      provider: 'evolution',
       displayName: displayName || undefined,
       instanceId: instanceName,
       status: 'pending',
@@ -62,8 +95,7 @@ export const createWhatsAppAccount = async (req: ClientRequest, res: Response): 
       try {
         const newInstance = await createInstance(instanceName);
         qrCode = extractQrCode(newInstance);
-        const webhookUrl = `${process.env.APP_URL}/api/webhooks/evolution`;
-        await setWebhook(instanceName, webhookUrl);
+        await setWebhook(instanceName, buildEvolutionWebhookUrl());
         if (!qrCode) {
           const connectRes = await connectInstance(instanceName);
           qrCode = extractQrCode(connectRes);
@@ -113,7 +145,15 @@ export const getWhatsAppAccountStatus = async (req: ClientRequest, res: Response
       return;
     }
 
-    const state = await getConnectionState(account.instanceId);
+    if (account.provider === 'cloud') {
+      res.json({
+        status: account.status,
+        qrCode: null,
+      });
+      return;
+    }
+
+    const state = account.instanceId ? await getConnectionState(account.instanceId) : null;
     const status = mapEvolutionStateToStatus(state);
     const qrCode = extractQrCode(state);
 
@@ -143,6 +183,16 @@ export const refreshWhatsAppAccountQr = async (req: ClientRequest, res: Response
       return;
     }
 
+    if (account.provider === 'cloud') {
+      res.status(400).json({ message: 'QR code is not available for cloud accounts' });
+      return;
+    }
+
+    if (!account.instanceId) {
+      res.status(400).json({ message: 'WhatsApp not configured' });
+      return;
+    }
+
     const connectRes = await connectInstance(account.instanceId);
     const qrCode = extractQrCode(connectRes);
     if (account.status !== 'pending') {
@@ -165,6 +215,18 @@ export const disconnectWhatsAppAccount = async (req: ClientRequest, res: Respons
       return;
     }
 
+    if (account.provider === 'cloud') {
+      account.status = 'disconnected';
+      await account.save();
+      res.json({ message: 'Disconnected successfully' });
+      return;
+    }
+
+    if (!account.instanceId) {
+      res.status(400).json({ message: 'WhatsApp not configured' });
+      return;
+    }
+
     await logoutInstance(account.instanceId);
     account.status = 'disconnected';
     await account.save();
@@ -174,4 +236,3 @@ export const disconnectWhatsAppAccount = async (req: ClientRequest, res: Respons
     res.status(500).json({ message: error.message });
   }
 };
-
