@@ -1,9 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
-import { CheckCircle, Plus, QrCode, RefreshCcw, Smartphone, Unplug, List } from 'lucide-react';
+import { CheckCircle, Plus, QrCode, RefreshCcw, Smartphone, Trash2, Unplug, List } from 'lucide-react';
 import { useAuthStore } from '../store/useAuthStore';
 import MetaLogsModal from '../components/MetaLogsModal';
 import MqlCriteriaCard from '../components/MqlCriteriaCard';
+import ConnectionInvitesCard from '../components/ConnectionInvitesCard';
 
 type WhatsAppStatus = 'connected' | 'disconnected' | 'pending';
 
@@ -67,6 +68,12 @@ const Connection = () => {
   const [metaTestCtwaClid, setMetaTestCtwaClid] = useState('');
   const [metaTestPhone, setMetaTestPhone] = useState('5511999999999');
   const [metaTriggerLevel, setMetaTriggerLevel] = useState<'cold' | 'warm' | 'hot'>('hot');
+  // deleting a WhatsApp number (the confirmation dialog)
+  const [deleteTarget, setDeleteTarget] = useState<WhatsAppAccount | null>(null);
+  const [deleteConversations, setDeleteConversations] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<{ message: string; canForce: boolean } | null>(null);
+
   const [metaSendUntracked, setMetaSendUntracked] = useState(false);
   const [metaEvents, setMetaEvents] = useState({
     leadSubmitted: { enabled: false, minInbound: 2 },
@@ -290,6 +297,44 @@ const Connection = () => {
     }
   };
 
+  const openDelete = (account: WhatsAppAccount) => {
+    setDeleteTarget(account);
+    setDeleteConversations(false);
+    setDeleteError(null);
+  };
+
+  const closeDelete = () => {
+    if (deleting) return;
+    setDeleteTarget(null);
+    setDeleteError(null);
+  };
+
+  const confirmDelete = async (force = false) => {
+    if (!deleteTarget) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      const query = new URLSearchParams();
+      if (deleteConversations) query.set('deleteConversations', 'true');
+      if (force) query.set('force', 'true');
+      const suffix = query.toString() ? `?${query.toString()}` : '';
+
+      await axios.delete(`/api/whatsapp-accounts/${deleteTarget._id}${suffix}`, headers);
+
+      if (selectedWhatsAppAccountId === deleteTarget._id) setSelectedWhatsAppAccountId(null);
+      setAccounts((prev) => prev.filter((a) => a._id !== deleteTarget._id));
+      setDeleteTarget(null);
+      await fetchAccounts();
+    } catch (e: any) {
+      setDeleteError({
+        message: String(e?.response?.data?.message || 'Não foi possível excluir. Tente de novo.'),
+        canForce: Boolean(e?.response?.data?.canForce),
+      });
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   useEffect(() => {
     fetchAccounts();
   }, [user, selectedClientId]);
@@ -453,6 +498,15 @@ const Connection = () => {
                   >
                     <Unplug size={16} />
                     Desconectar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => openDelete(activeAccount)}
+                    disabled={panelLoading}
+                    className="inline-flex items-center gap-2 px-3 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+                  >
+                    <Trash2 size={16} />
+                    Excluir
                   </button>
                 </div>
               )}
@@ -787,8 +841,91 @@ const Connection = () => {
         </div>
       </div>
       <div className="mt-6">
+        <ConnectionInvitesCard onAccountsChanged={fetchAccounts} />
+      </div>
+
+      <div className="mt-6">
         <MqlCriteriaCard />
       </div>
+      {deleteTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={closeDelete}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-whatsapp-title"
+            className="w-full max-w-md rounded-xl bg-white shadow-lg border border-zinc-200"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="p-5 border-b border-zinc-200">
+              <h4 id="delete-whatsapp-title" className="font-semibold text-zinc-900">
+                Excluir {deleteTarget.displayName ? `"${deleteTarget.displayName}"` : 'este WhatsApp'}?
+              </h4>
+              <p className="text-xs text-zinc-500 mt-0.5 truncate">{deleteTarget.phoneNumber || deleteTarget.instanceId}</p>
+            </div>
+
+            <div className="p-5 space-y-4 text-sm text-zinc-700">
+              <p>
+                A conexão será removida e o aparelho deixa de ficar vinculado ao sistema. Para voltar a usar este número,
+                será preciso conectar de novo.
+              </p>
+              <p className="text-zinc-600">
+                As conversas e os leads deste número <strong>continuam no sistema</strong> (Dashboard, Kanban e histórico).
+              </p>
+
+              <label className="flex items-start gap-3 rounded-lg border border-zinc-200 bg-zinc-50 p-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={deleteConversations}
+                  onChange={(e) => setDeleteConversations(e.target.checked)}
+                  disabled={deleting}
+                  className="mt-0.5 h-4 w-4 rounded border-zinc-300"
+                />
+                <span>
+                  Apagar também as conversas e mensagens deste número
+                  <span className="block text-xs text-red-600 mt-0.5">
+                    Não dá para desfazer. Os leads somem do Dashboard e do Kanban. O registro dos eventos já enviados ao Meta é mantido.
+                  </span>
+                </span>
+              </label>
+
+              {deleteError && (
+                <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs text-red-700" role="alert">
+                  {deleteError.message}
+                </div>
+              )}
+            </div>
+
+            <div className="p-5 border-t border-zinc-200 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeDelete}
+                disabled={deleting}
+                className="px-3 py-2 rounded-lg bg-white border border-zinc-200 text-zinc-700 text-sm font-medium hover:bg-zinc-50 disabled:opacity-50"
+              >
+                Cancelar
+              </button>
+              {deleteError?.canForce && (
+                <button
+                  type="button"
+                  onClick={() => void confirmDelete(true)}
+                  disabled={deleting}
+                  className="px-3 py-2 rounded-lg bg-white border border-red-200 text-red-600 text-sm font-medium hover:bg-red-50 disabled:opacity-50"
+                >
+                  Excluir mesmo assim
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void confirmDelete(false)}
+                disabled={deleting}
+                className="px-3 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-700 disabled:opacity-50"
+              >
+                {deleting ? 'Excluindo…' : deleteConversations ? 'Excluir tudo' : 'Excluir WhatsApp'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       <MetaLogsModal isOpen={logsModalOpen} onClose={() => setLogsModalOpen(false)} />
     </div>
   );

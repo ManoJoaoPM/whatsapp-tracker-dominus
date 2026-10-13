@@ -112,6 +112,29 @@ export const connectInstance = async (instanceName: string) => {
   }
 };
 
+/**
+ * Pairing code: lets someone link WhatsApp by typing an 8-character code instead of scanning a QR
+ * ("Connect with phone number" in WhatsApp). Needed when the page is opened on the same phone
+ * that runs WhatsApp. Returns null when this Evolution version does not provide it.
+ */
+export const requestPairingCode = async (instanceName: string, phoneDigits: string): Promise<string | null> => {
+  try {
+    const response = await axios.get(`${EVOLUTION_API_URL}/instance/connect/${instanceName}`, {
+      headers: {
+        ...evolutionHeaders(),
+      },
+      params: { number: phoneDigits },
+      timeout: 25_000,
+    });
+    const code = response.data?.pairingCode;
+    return typeof code === 'string' && code.trim() ? code.trim() : null;
+  } catch (error: any) {
+    // never log the phone number
+    console.error('Error requesting pairing code:', error?.response?.status, error?.response?.data || error?.message);
+    return null;
+  }
+};
+
 export const getConnectionState = async (instanceName: string) => {
   try {
     const response = await axios.get(
@@ -140,6 +163,28 @@ export const logoutInstance = async (instanceName: string) => {
   } catch (error) {
     console.error('Error logging out instance:', error);
     return false;
+  }
+};
+
+/**
+ * Removes the instance from Evolution (it is logged out first so the phone stops listing it
+ * under "Linked devices"). An instance that no longer exists counts as removed.
+ */
+export const deleteInstance = async (instanceName: string): Promise<'deleted' | 'not_found' | 'failed'> => {
+  await logoutInstance(instanceName).catch(() => false);
+
+  try {
+    await axios.delete(`${EVOLUTION_API_URL}/instance/delete/${instanceName}`, {
+      headers: {
+        ...evolutionHeaders(),
+      },
+      timeout: 20_000,
+    });
+    return 'deleted';
+  } catch (error: any) {
+    if (error?.response?.status === 404) return 'not_found';
+    console.error('Error deleting Evolution instance:', error?.response?.status, error?.response?.data || error?.message);
+    return 'failed';
   }
 };
 

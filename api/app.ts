@@ -21,6 +21,8 @@ import clientsRoutes from './routes/clients.js'
 import mqlRoutes from './routes/mql.js'
 import whatsappAccountsRoutes from './routes/whatsappAccounts.js'
 import integrationsRoutes from './routes/integrations.js'
+import connectionInviteRoutes from './routes/connectionInvites.js'
+import publicConnectRoutes from './routes/publicConnect.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -31,6 +33,12 @@ dotenv.config()
 const app: express.Application = express()
 
 app.set('etag', false)
+
+// Behind a reverse proxy (nginx, Traefik...) req.ip would be the proxy. TRUST_PROXY=1 trusts one hop.
+if (process.env.TRUST_PROXY) {
+  const raw = process.env.TRUST_PROXY.trim()
+  app.set('trust proxy', /^\d+$/.test(raw) ? Number(raw) : raw === 'true' ? true : raw)
+}
 
 app.use(cors())
 app.use(
@@ -66,6 +74,8 @@ app.use('/api/admin', adminRoutes)
 app.use('/api/clients', clientsRoutes)
 app.use('/api/mql', mqlRoutes)
 app.use('/api/integrations', integrationsRoutes)
+app.use('/api/connection-invites', connectionInviteRoutes)
+app.use('/api/public/connect', publicConnectRoutes)
 
 /**
  * health

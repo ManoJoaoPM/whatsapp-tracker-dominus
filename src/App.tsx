@@ -8,6 +8,7 @@ import Conversations from "@/pages/Conversations";
 import Connection from "@/pages/Connection";
 import Admin from "@/pages/Admin";
 import Kanban from "@/pages/Kanban";
+import PublicConnect from "@/pages/PublicConnect";
 import { useAuthStore } from "@/store/useAuthStore";
 import { LayoutDashboard, MessageSquare, Briefcase, Settings, LogOut, KanbanSquare } from "lucide-react";
 
@@ -18,6 +19,8 @@ export default function App() {
         <Route path="/" element={<Navigate to="/login" replace />} />
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
+        {/* Public link sent to customers: no login, outside the dashboard layout */}
+        <Route path="/conectar/:token" element={<PublicConnect />} />
         <Route path="/dashboard" element={<DashboardLayout><Dashboard /></DashboardLayout>} />
         <Route path="/conversations" element={<DashboardLayout><Conversations /></DashboardLayout>} />
         <Route path="/app/kanban" element={<DashboardLayout><Kanban /></DashboardLayout>} />

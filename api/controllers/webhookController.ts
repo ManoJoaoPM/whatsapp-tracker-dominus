@@ -4,6 +4,7 @@ import Client from '../models/Client.js';
 import WhatsAppAccount from '../models/WhatsAppAccount.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
+import ConnectionInvite from '../models/ConnectionInvite.js';
 import OriginEvent from '../models/OriginEvent.js';
 import MetaLeadLog from '../models/MetaLeadLog.js';
 import { getMediaMessageModel } from '../config/mediaDb.js';
@@ -115,7 +116,15 @@ export const handleEvolutionWebhook = async (req: Request, res: Response): Promi
           account.connectedAt = new Date();
         }
         await account.save();
-        
+
+        // A customer link that created this number is done once the number is connected
+        if (newStatus === 'connected') {
+          await ConnectionInvite.updateMany(
+            { whatsappAccountId: account._id, status: { $in: ['pending', 'started'] } },
+            { $set: { status: 'connected', connectedAt: new Date() }, $unset: { provisioningAt: 1 } },
+          ).catch((err) => console.error('Could not update connection invite:', err?.message || err));
+        }
+
         // Notify frontend
         if (io) {
           // const roomSize = io.sockets?.adapter?.rooms?.get?.(client.id)?.size || 0;

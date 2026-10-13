@@ -1,33 +1,18 @@
 import { Response } from 'express';
-import mongoose from 'mongoose';
 import { ClientRequest } from '../middlewares/clientMiddleware.js';
 import WhatsAppAccount from '../models/WhatsAppAccount.js';
+import Conversation from '../models/Conversation.js';
+import Message from '../models/Message.js';
+import MqlEvaluation from '../models/MqlEvaluation.js';
+import MetaLeadLog from '../models/MetaLeadLog.js';
+import ConnectionInvite from '../models/ConnectionInvite.js';
+import { getMediaMessageModel } from '../config/mediaDb.js';
+import { connectInstance, deleteInstance, getConnectionState, logoutInstance } from '../services/evolutionService.js';
 import {
-  buildEvolutionWebhookUrl,
-  connectInstance,
-  createInstance,
-  getConnectionState,
-  logoutInstance,
-  setWebhook,
-} from '../services/evolutionService.js';
-
-const extractQrCode = (payload: any) => {
-  return (
-    payload?.qrcode?.base64 ||
-    payload?.qrcode?.code ||
-    payload?.qrcode ||
-    payload?.base64 ||
-    payload?.code ||
-    null
-  );
-};
-
-const mapEvolutionStateToStatus = (state: any): 'connected' | 'disconnected' | 'pending' => {
-  const s = state?.instance?.state;
-  if (s === 'open') return 'connected';
-  if (s === 'close') return 'disconnected';
-  return 'pending';
-};
+  extractQrCode,
+  mapEvolutionStateToStatus,
+  provisionEvolutionAccount,
+} from '../services/whatsappProvisioning.js';
 
 export const listWhatsAppAccounts = async (req: ClientRequest, res: Response): Promise<void> => {
   try {
@@ -76,56 +61,10 @@ export const createWhatsAppAccount = async (req: ClientRequest, res: Response): 
       return;
     }
 
-    const suffix = new mongoose.Types.ObjectId().toHexString();
-    const instanceName = `client_${String(client.id)}_wa_${suffix}`;
-
-    const account = await WhatsAppAccount.create({
-      clientId: client.id,
-      provider: 'evolution',
+    const { account, qrCode } = await provisionEvolutionAccount({
+      clientId: String(client.id),
       displayName: displayName || undefined,
-      instanceId: instanceName,
-      status: 'pending',
     });
-
-    const existingState = await getConnectionState(instanceName);
-
-    let qrCode: string | null = null;
-
-    if (!existingState) {
-      try {
-        const newInstance = await createInstance(instanceName);
-        qrCode = extractQrCode(newInstance);
-        await setWebhook(instanceName, buildEvolutionWebhookUrl());
-        if (!qrCode) {
-          const connectRes = await connectInstance(instanceName);
-          qrCode = extractQrCode(connectRes);
-        }
-      } catch (err: any) {
-        if (err?.message === 'Instance already exists') {
-          try {
-            const connectRes = await connectInstance(instanceName);
-            qrCode = extractQrCode(connectRes);
-          } catch {
-          }
-        } else {
-          throw err;
-        }
-      }
-    } else {
-      qrCode = extractQrCode(existingState);
-      if (!qrCode && existingState?.instance?.state !== 'open') {
-        try {
-          const connectRes = await connectInstance(instanceName);
-          qrCode = extractQrCode(connectRes);
-        } catch {
-        }
-      }
-      const nextStatus = mapEvolutionStateToStatus(existingState);
-      if (nextStatus !== account.status) {
-        account.status = nextStatus;
-        await account.save();
-      }
-    }
 
     res.json({
       account,
@@ -232,6 +171,77 @@ export const disconnectWhatsAppAccount = async (req: ClientRequest, res: Respons
     await account.save();
 
     res.json({ message: 'Disconnected successfully' });
+  } catch (error: any) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+/**
+ * Removes a WhatsApp number from the company.
+ *
+ * - Evolution numbers are logged out and their instance is deleted. If Evolution does not answer,
+ *   nothing is removed unless the caller insists with ?force=true (the number could stay linked
+ *   to the phone otherwise).
+ * - Conversations and messages are KEPT by default: they feed the dashboard, the kanban and the
+ *   history of leads already reported to Meta. ?deleteConversations=true removes them for good.
+ * - The record of events sent to Meta (MetaEventLog) is always kept as an audit trail.
+ */
+export const deleteWhatsAppAccount = async (req: ClientRequest, res: Response): Promise<void> => {
+  try {
+    const { id } = req.params;
+    const account = await WhatsAppAccount.findOne({ _id: id, clientId: req.currentClient.id });
+    if (!account) {
+      res.status(404).json({ message: 'WhatsApp account not found' });
+      return;
+    }
+
+    const force = req.query.force === 'true';
+    const deleteConversations = req.query.deleteConversations === 'true';
+
+    if (account.provider !== 'cloud' && account.instanceId) {
+      const result = await deleteInstance(account.instanceId);
+      if (result === 'failed' && !force) {
+        res.status(502).json({
+          message:
+            'Não foi possível remover a conexão no servidor do WhatsApp agora. Tente de novo ou exclua mesmo assim (o aparelho pode continuar vinculado).',
+          canForce: true,
+        });
+        return;
+      }
+    }
+
+    let deletedConversations = 0;
+    let deletedMessages = 0;
+
+    if (deleteConversations) {
+      const filter = { clientId: account.clientId, whatsappAccountId: account._id };
+      const conversationIds = await Conversation.find(filter).distinct('_id');
+
+      if (conversationIds.length > 0) {
+        await MqlEvaluation.deleteMany({ conversationId: { $in: conversationIds } });
+      }
+      await MetaLeadLog.deleteMany(filter);
+
+      const messages = await Message.deleteMany(filter);
+      deletedMessages = messages.deletedCount ?? 0;
+
+      // images and audios live in the secondary database
+      const MediaMessage = await getMediaMessageModel().catch(() => null);
+      if (MediaMessage) await MediaMessage.deleteMany(filter).catch(() => undefined);
+
+      const conversations = await Conversation.deleteMany(filter);
+      deletedConversations = conversations.deletedCount ?? 0;
+    }
+
+    // customer links that created this number: an unfinished one starts over, a finished one stays as history
+    await ConnectionInvite.updateMany(
+      { whatsappAccountId: account._id, status: { $in: ['pending', 'started'] } },
+      { $set: { status: 'pending' }, $unset: { whatsappAccountId: 1, provisioningAt: 1 } },
+    );
+
+    await WhatsAppAccount.deleteOne({ _id: account._id });
+
+    res.json({ ok: true, deletedConversations, deletedMessages });
   } catch (error: any) {
     res.status(500).json({ message: error.message });
   }

@@ -3,6 +3,7 @@ import { protect } from '../middlewares/authMiddleware.js';
 import { requireClient } from '../middlewares/clientMiddleware.js';
 import {
   createWhatsAppAccount,
+  deleteWhatsAppAccount,
   disconnectWhatsAppAccount,
   getWhatsAppAccountStatus,
   listWhatsAppAccounts,
@@ -16,6 +17,7 @@ router.post('/', protect, requireClient, createWhatsAppAccount);
 router.get('/:id/status', protect, requireClient, getWhatsAppAccountStatus);
 router.post('/:id/refresh-qr', protect, requireClient, refreshWhatsAppAccountQr);
 router.post('/:id/disconnect', protect, requireClient, disconnectWhatsAppAccount);
+router.delete('/:id', protect, requireClient, deleteWhatsAppAccount);
 
 export default router;
 
